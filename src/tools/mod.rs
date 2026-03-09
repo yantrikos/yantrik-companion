@@ -99,6 +99,13 @@ pub mod claude;
 pub mod vault;
 pub mod coder;
 pub mod plugin;
+pub mod spawn_agents;
+pub mod edit;
+pub mod grep;
+pub mod glob;
+pub mod mcp;
+pub mod whatsapp;
+pub mod github;
 
 use crate::config::CompanionConfig;
 use yantrikdb_core::YantrikDB;
@@ -161,6 +168,19 @@ pub trait Tool: Send + Sync {
     fn execute(&self, ctx: &ToolContext, args: &serde_json::Value) -> String;
 }
 
+/// Context needed to spawn parallel sub-agents from a tool.
+#[derive(Clone)]
+pub struct AgentSpawnerContext {
+    pub llm: std::sync::Arc<dyn yantrik_ml::LLMBackend>,
+    pub db_path: String,
+    pub embedding_dim: usize,
+    pub max_steps: usize,
+    pub max_tokens: usize,
+    pub temperature: f64,
+    pub user_name: String,
+    pub config: crate::config::CompanionConfig,
+}
+
 /// Shared context passed to every tool at execution time.
 pub struct ToolContext<'a> {
     pub db: &'a YantrikDB,
@@ -172,6 +192,8 @@ pub struct ToolContext<'a> {
     pub task_manager: Option<&'a std::sync::Mutex<crate::task_manager::TaskManager>>,
     /// When true, tools that persist data should skip saving.
     pub incognito: bool,
+    /// Context for spawning parallel sub-agents.
+    pub agent_spawner: Option<&'a AgentSpawnerContext>,
 }
 
 /// Compact tool metadata for discovery (no full JSON schema).
@@ -451,6 +473,18 @@ pub fn build_registry(config: &CompanionConfig) -> ToolRegistry {
         }
     }
 
+    // Conditionally register WhatsApp tools
+    let wa = &config.whatsapp;
+    if wa.enabled {
+        if let (Some(phone_id), Some(token)) = (&wa.phone_number_id, &wa.access_token) {
+            let recipient = wa.recipient.as_deref().unwrap_or("");
+            whatsapp::register(&mut reg, phone_id, token, recipient);
+            tracing::info!("WhatsApp tool registered");
+        } else {
+            tracing::warn!("WhatsApp enabled but phone_number_id or access_token missing — skipping");
+        }
+    }
+
     // Conditionally register email tools
     if config.email.enabled && !config.email.accounts.is_empty() {
         email::register(&mut reg, config.email.accounts.clone());
@@ -476,8 +510,20 @@ pub fn build_registry(config: &CompanionConfig) -> ToolRegistry {
         tracing::info!(base = %ollama_base, model, "Vision & Canvas tools registered");
     }
 
+    // GitHub API tools (works without auth for public repos)
+    github::register(&mut reg, config.connectors.github_token.as_deref());
+
     // Load YAML plugins from ~/.config/yantrik/plugins/
     plugin::load_plugins(&mut reg);
+    spawn_agents::register(&mut reg);
+    edit::register(&mut reg);
+    grep::register(&mut reg);
+    glob::register(&mut reg);
+
+    // Connect MCP servers and register their tools
+    if !config.mcp_servers.is_empty() {
+        mcp::register_mcp_servers(&mut reg, &config.mcp_servers);
+    }
 
     reg
 }

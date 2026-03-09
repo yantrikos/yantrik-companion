@@ -6,8 +6,17 @@
 
 use yantrikdb_core::YantrikDB;
 use yantrik_ml::{
-    ChatMessage, GenerationConfig, LLMBackend, ToolCall,
+    ChatMessage, GenerationConfig, LLMBackend, ToolCall, ToolCallMode,
+    ModelCapabilityProfile, ToolFamily,
     format_tools, parse_tool_calls, extract_text_content,
+};
+
+use crate::active_context::ActiveDayContext;
+use crate::hallucination_firewall::{
+    HallucinationFirewall, FirewallConfig, FirewallAction, GroundTruth,
+};
+use crate::structured_output::{
+    StructuredDecisionParser, StructuredDecisionValidator, ValidationResult, RepairPrompt,
 };
 
 use crate::agent_loop::AgentLoop;
@@ -38,11 +47,18 @@ pub const ALWAYS_TOOLS: &[&str] = &[
     "run_command", "web_search", "calculate",
 ];
 
+/// Minimal tools for fallback/degraded mode — tiny models can't handle many tools.
+pub const FALLBACK_TOOLS: &[&str] = &[
+    "recall", "remember", "run_command",
+];
+
 /// Tool categories for keyword-based routing.
 /// Each entry: (category_name, keyword_patterns, tool_names).
 pub const TOOL_CATEGORIES: &[(&str, &[&str], &[&str])] = &[
-    ("files", &["file", "read", "write", "directory", "folder", "list files", "search file", "find file", "create file", "edit file", "delete file", "save"],
-     &["read_file", "write_file", "list_files", "search_files"]),
+    ("files", &["file", "read", "write", "directory", "folder", "list files", "search file", "find file",
+                "create file", "edit file", "delete file", "save", "grep", "glob", "pattern", "regex",
+                "replace", "modify file", "change file", "update file", "patch"],
+     &["read_file", "write_file", "list_files", "search_files", "edit_file", "grep", "glob"]),
     ("system", &["system", "process", "disk", "cpu", "memory usage", "uptime", "diagnose", "kill"],
      &["system_info", "disk_usage", "list_processes", "diagnose_process", "date_calc"]),
     ("browser", &["browse", "website", "click", "navigate", "open page", "web page", "url", "browser", "screenshot"],
@@ -66,8 +82,8 @@ pub const TOOL_CATEGORIES: &[(&str, &[&str], &[&str])] = &[
      &["telegram_send", "send_notification"]),
     ("life", &["recommend", "suggestion", "preference", "find me", "search for", "best", "top", "nearby", "restaurant", "hotel"],
      &["life_search", "recall_preferences", "save_user_fact", "search_sources", "extract_search_results", "rank_results"]),
-    ("memory", &["memory", "memories", "forget", "conflict", "review memory"],
-     &["memory_stats", "resolve_conflicts", "review_memories"]),
+    ("memory", &["memory", "memories", "forget", "conflict", "review memory", "stop talking", "don't bring up", "stop tracking", "drop topic"],
+     &["memory_stats", "resolve_conflicts", "review_memories", "forget_topic"]),
     ("tasks", &["task", "queue", "todo", "backlog"],
      &["queue_task", "list_tasks", "update_task", "complete_task"]),
     ("recipes", &["recipe", "automation", "workflow", "automate"],
@@ -76,8 +92,13 @@ pub const TOOL_CATEGORIES: &[(&str, &[&str], &[&str])] = &[
      &["get_weather"]),
     ("connectors", &["connect", "oauth", "google", "spotify", "sync service"],
      &["list_connections", "connect_service", "sync_service", "disconnect_service"]),
-    ("delegation", &["think hard", "complex", "analyze", "deep think", "claude"],
-     &["claude_think", "claude_code"]),
+    ("delegation", &["think hard", "complex", "analyze", "deep think", "claude",
+                      "parallel", "simultaneously", "at the same time", "agents", "multiple tasks",
+                      "spawn", "concurrent"],
+     &["claude_think", "claude_code", "spawn_agents"]),
+    ("github", &["github", "repo", "repos", "repository", "stars", "github profile", "starred",
+                  "open source", "contributions", "forks"],
+     &["github_repos", "github_stars", "github_profile"]),
     ("bond", &["bond", "relationship", "trust level"],
      &["check_bond"]),
     ("screenshot", &["screenshot", "capture screen", "screen"],
@@ -103,7 +124,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "calculate", "screenshot",
     "email_check", "email_list", "email_read", "email_send", "email_reply", "email_search",
     "calendar_today", "calendar_list_events", "calendar_create_event", "calendar_update_event", "calendar_delete_event",
-    "memory_stats", "resolve_conflicts", "review_memories",
+    "memory_stats", "resolve_conflicts", "review_memories", "forget_topic",
     "queue_task", "list_tasks", "update_task", "complete_task",
     "create_recipe", "list_recipes", "run_recipe",
     "claude_think", "claude_code",
@@ -167,10 +188,96 @@ pub fn select_tools_for_query(query: &str, db: &YantrikDB, max_extra: usize) -> 
     selected
 }
 
+/// Adaptive tool selection using ToolFamily routing + ModelCapabilityProfile.
+///
+/// For models with `use_family_routing = true`, routes the query to semantic
+/// tool families first, then exposes only that family's tools (up to `max_tools_per_prompt`).
+/// Falls back to the legacy `select_tools_for_query` when family routing is disabled
+/// or when no family matches.
+pub fn select_tools_adaptive(
+    query: &str,
+    db: &YantrikDB,
+    profile: &ModelCapabilityProfile,
+) -> Vec<&'static str> {
+    // Always start with ALWAYS_TOOLS
+    let mut selected: Vec<&'static str> = ALWAYS_TOOLS.to_vec();
+
+    if !profile.use_family_routing {
+        // Large models or disabled routing: use legacy category-based selection
+        let legacy = select_tools_for_query(query, db, profile.max_tools_per_prompt);
+        return legacy;
+    }
+
+    // Family-based routing: route to best-matching families
+    let families = ToolFamily::route_query(query);
+
+    if families.is_empty() {
+        // No family matched — fall back to ALWAYS_TOOLS + embedding fallback
+        let relevant = crate::tool_cache::ToolCache::select_relevant(
+            db.conn(), db, query, profile.max_tools_per_prompt.saturating_sub(selected.len()),
+        );
+        for def in &relevant {
+            if let Some(name) = def["function"]["name"].as_str() {
+                // Find the static &str reference from TOOL_CATEGORIES
+                for &(_, _, tools) in TOOL_CATEGORIES {
+                    for &tool in tools {
+                        if tool == name && !selected.contains(&tool) {
+                            selected.push(tool);
+                        }
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            query_short = &query[..query.len().min(60)],
+            family = "none",
+            total = selected.len(),
+            tier = %profile.tier,
+            "Adaptive tool selection (embedding fallback)"
+        );
+        return selected;
+    }
+
+    // Add tools from matched families (best match first, up to budget)
+    let budget = profile.max_tools_per_prompt.saturating_sub(selected.len());
+    let mut tools_added = 0usize;
+    let mut matched_family_names = Vec::new();
+
+    for (family, _score) in &families {
+        if tools_added >= budget {
+            break;
+        }
+        matched_family_names.push(family.to_string());
+        for &tool_name in family.tools() {
+            if tools_added >= budget {
+                break;
+            }
+            // Only add if the tool exists in our TOOL_CATEGORIES (registered in this build)
+            let is_registered = TOOL_CATEGORIES.iter()
+                .any(|&(_, _, cat_tools)| cat_tools.contains(&tool_name));
+            if is_registered && !selected.contains(&tool_name) {
+                selected.push(tool_name);
+                tools_added += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        query_short = &query[..query.len().min(60)],
+        families = ?matched_family_names,
+        total = selected.len(),
+        tier = %profile.tier,
+        max_budget = profile.max_tools_per_prompt,
+        "Adaptive tool selection (family routing)"
+    );
+
+    selected
+}
+
 /// The companion agent — memory + inference + instincts + bond + evolution in one struct.
 pub struct CompanionService {
     pub db: YantrikDB,
-    pub llm: Box<dyn LLMBackend>,
+    pub llm: std::sync::Arc<dyn LLMBackend>,
     pub config: CompanionConfig,
     pub urge_queue: UrgeQueue,
     instincts: Vec<Box<dyn Instinct>>,
@@ -265,11 +372,22 @@ pub struct CompanionService {
 
     /// Connector state — OAuth connector manager for external services.
     pub connector_state: Option<std::sync::Arc<std::sync::Mutex<tools::connector::ConnectorState>>>,
+
+    /// Cognitive Event Bus — typed, causal, replayable event system.
+    pub event_bus: Option<yantrik_os::EventBus>,
+
+    /// Model Capability Profile — auto-detected from LLM model name.
+    /// Controls tool exposure, routing strategy, context budgets, and guardrails.
+    pub capability_profile: ModelCapabilityProfile,
+
+    /// Active Day Context — ambient awareness buffer (calendar, weather, email, etc.).
+    /// Refreshed by stewardship loop, injected into system prompt per token budget.
+    pub active_context: ActiveDayContext,
 }
 
 impl CompanionService {
     /// Create a new companion from pre-built YantrikDB and LLM backend.
-    pub fn new(db: YantrikDB, llm: Box<dyn LLMBackend>, config: CompanionConfig) -> Self {
+    pub fn new(db: YantrikDB, llm: std::sync::Arc<dyn LLMBackend>, config: CompanionConfig) -> Self {
         // Ensure soul tables exist
         BondTracker::ensure_tables(db.conn());
         Evolution::ensure_tables(db.conn());
@@ -291,6 +409,15 @@ impl CompanionService {
         // Phase 2: Proactive intelligence tables
         ensure_workflow_table(db.conn());
         ensure_maintenance_table(db.conn());
+
+        // Tool reliability metrics table
+        crate::tool_metrics::ToolMetrics::ensure_table(db.conn());
+
+        // World model tables (commitments, preferences, routines)
+        crate::world_model::WorldModel::ensure_tables(db.conn());
+
+        // Offline NLP + cognitive router tables
+        crate::cognitive_router::ensure_tables(db.conn());
 
         // Tool trace learning table
         ToolTraces::ensure_table(db.conn());
@@ -332,11 +459,23 @@ impl CompanionService {
             Some(arc)
         };
 
+        // Auto-detect model capability profile from LLM model identifier.
+        let capability_profile = if llm.is_degraded() {
+            ModelCapabilityProfile::degraded()
+        } else {
+            ModelCapabilityProfile::from_model_name(llm.model_id())
+        };
+        tracing::info!(
+            profile = %capability_profile.summary(),
+            model_id = llm.model_id(),
+            "Model capability profile detected"
+        );
+
         // Build stable tools prefix — ALWAYS_TOOLS only (small set for KV caching).
         // Additional tools selected dynamically per query via select_tools_for_query().
         // Full tool set discoverable via discover_tools meta-tool.
         let max_perm = parse_permission(&config.tools.max_permission);
-        let use_native_tools = llm.backend_name() == "api";
+        let use_native_tools = llm.backend_name() == "api" && capability_profile.uses_native_tools();
 
         // Native tools: only ALWAYS_TOOLS (6 tools) — rest added dynamically per query
         tracing::debug!(always_on = ALWAYS_TOOLS.len(), "Dynamic tool selection initialized");
@@ -454,7 +593,15 @@ impl CompanionService {
             connector_state,
             user_interests,
             user_location,
+            event_bus: None,
+            capability_profile,
+            active_context: ActiveDayContext::new(),
         }
+    }
+
+    /// Attach a cognitive event bus for tool execution tracing.
+    pub fn set_event_bus(&mut self, bus: yantrik_os::EventBus) {
+        self.event_bus = Some(bus);
     }
 
     /// Apply a Skill Store snapshot — merges skill-derived services with config,
@@ -549,6 +696,7 @@ impl CompanionService {
             registry_metadata: None,
             task_manager: Some(&self.task_manager),
             incognito: self.incognito,
+            agent_spawner: None,
         };
         self.registry.execute(&ctx, tool_name, args)
     }
@@ -624,47 +772,44 @@ impl CompanionService {
             }
         }
 
-        // Step 6: Build bond-aware LLM context
-        let personality = self.db.get_personality().ok();
-        let patterns_json: Vec<serde_json::Value> = self
-            .active_patterns
-            .iter()
-            .cloned()
-            .collect();
+        // Step 6: Build LLM context — lightweight for degraded mode, full otherwise
+        let degraded = self.llm.is_degraded();
+        if degraded {
+            tracing::info!("LLM degraded — using lightweight prompt and minimal tools");
+        }
 
-        // Gather soul signals
-        let narrative_text = Narrative::get(self.db.conn());
-        let style = Evolution::get_style(self.db.conn());
-        let opinions = Evolution::get_opinions(self.db.conn(), 3);
-        let shared_refs = if self.config.memory_evolution.reference_freshness_enabled {
-            memory_evolution::get_fresh_references(self.db.conn(), 3)
+        let context_messages = if degraded {
+            context::build_messages_lightweight(
+                user_text, &self.config, &memories, &self.conversation_history,
+            )
         } else {
-            Evolution::get_shared_references(self.db.conn(), 3)
+            let personality = self.db.get_personality().ok();
+            let patterns_json: Vec<serde_json::Value> = self
+                .active_patterns.iter().cloned().collect();
+            let narrative_text = Narrative::get(self.db.conn());
+            let style = Evolution::get_style(self.db.conn());
+            let opinions = Evolution::get_opinions(self.db.conn(), 3);
+            let shared_refs = if self.config.memory_evolution.reference_freshness_enabled {
+                memory_evolution::get_fresh_references(self.db.conn(), 3)
+            } else {
+                Evolution::get_shared_references(self.db.conn(), 3)
+            };
+            let signals = ContextSignals {
+                self_memories: &self_memories,
+                narrative: &narrative_text,
+                style: &style,
+                opinions: &opinions,
+                shared_refs: &shared_refs,
+                system_state: &self.system_context,
+                recall_confidence,
+                recall_hint: recall_hint.as_deref(),
+            };
+            context::build_messages(
+                user_text, &self.config, &state, &memories, &urges,
+                &patterns_json, &self.conversation_history,
+                personality.as_ref(), Some(&signals), self.use_native_tools,
+            )
         };
-
-        let signals = ContextSignals {
-            self_memories: &self_memories,
-            narrative: &narrative_text,
-            style: &style,
-            opinions: &opinions,
-            shared_refs: &shared_refs,
-            system_state: &self.system_context,
-            recall_confidence,
-            recall_hint: recall_hint.as_deref(),
-        };
-
-        let context_messages = context::build_messages(
-            user_text,
-            &self.config,
-            &state,
-            &memories,
-            &urges,
-            &patterns_json,
-            &self.conversation_history,
-            personality.as_ref(),
-            Some(&signals),
-            self.use_native_tools,
-        );
 
         // Build message array — single system message (Qwen3.5 requires it):
         // [0] system: context (+ text-injected tools for non-API backends)
@@ -673,19 +818,28 @@ impl CompanionService {
         let max_perm = parse_permission(&self.config.tools.max_permission);
         let mut messages = Vec::with_capacity(context_messages.len() + 1);
 
-        // Dynamic tool selection: ALWAYS_TOOLS + keyword-routed + embedding fallback
-        // Dynamic tool selection: ALWAYS_TOOLS + keyword-routed + embedding fallback.
-        // Target: 8-15 tools per query instead of 83+.
+        // Dynamic tool selection — adaptive based on model capability profile
+        let active_profile = if degraded {
+            ModelCapabilityProfile::degraded()
+        } else {
+            self.capability_profile.clone()
+        };
+
         let word_count = user_text.split_whitespace().count();
         let needs_tools = self.config.tools.enabled && word_count > 2;
         tracing::info!(
             tools_enabled = self.config.tools.enabled,
             word_count,
             needs_tools,
+            degraded,
+            tier = %active_profile.tier,
+            max_tools = active_profile.max_tools_per_prompt,
             "Tool selection gate"
         );
-        let mut selected_tool_names: Vec<&str> = if needs_tools {
-            select_tools_for_query(user_text, &self.db, 8)
+        let mut selected_tool_names: Vec<&str> = if degraded {
+            FALLBACK_TOOLS.to_vec()
+        } else if needs_tools {
+            select_tools_adaptive(user_text, &self.db, &active_profile)
         } else {
             ALWAYS_TOOLS.to_vec()
         };
@@ -728,31 +882,53 @@ impl CompanionService {
             messages.extend(context_messages);
         }
 
-        // Tool chain learning: inject trace hints into system prompt
-        if self.config.agent.trace_learning && self.config.tools.enabled {
+        // Tool chain learning: inject trace hints into system prompt (skip in degraded mode)
+        if !degraded && self.config.agent.trace_learning && self.config.tools.enabled {
             let hints = ToolTraces::find_similar(
                 self.db.conn(), &self.db, user_text, 3,
                 self.config.agent.trace_min_similarity,
             );
             if !hints.is_empty() {
                 let hint_text = ToolTraces::format_hints(&hints);
-                // Inject into system message
                 if let Some(sys_msg) = messages.first_mut() {
                     sys_msg.content.push_str(&hint_text);
                 }
-                // Mark hints as used
                 for hint in &hints {
                     ToolTraces::mark_used(self.db.conn(), &hint.trace_id);
                 }
             }
         }
 
+        // Inject Active Day Context into system prompt (budget from capability profile)
+        if active_profile.ambient_context_budget > 0 {
+            self.active_context.prune_stale();
+            if let Some(context_block) = self.active_context.build_context_block(
+                active_profile.ambient_context_budget,
+            ) {
+                if let Some(sys_msg) = messages.first_mut() {
+                    sys_msg.content.push_str("\n\n");
+                    sys_msg.content.push_str(&context_block);
+                }
+                tracing::debug!(
+                    sections = self.active_context.section_count(),
+                    budget = active_profile.ambient_context_budget,
+                    "Injected active day context"
+                );
+            }
+        }
+
         // Step 7: Call LLM with robust agent loop
-        let gen_config = GenerationConfig {
-            max_tokens: self.config.llm.max_tokens,
-            temperature: self.config.llm.temperature,
-            top_p: Some(0.9),
-            ..Default::default()
+        // Generation config adapts to model capability profile
+        let gen_config = if degraded {
+            active_profile.tool_gen_config()
+        } else {
+            // Use profile-recommended config, but respect user overrides from config.yaml
+            GenerationConfig {
+                max_tokens: self.config.llm.max_tokens.min(active_profile.max_generation_tokens),
+                temperature: self.config.llm.temperature,
+                top_p: Some(0.9),
+                ..Default::default()
+            }
         };
 
         let mut tool_calls_made = Vec::new();
@@ -760,11 +936,39 @@ impl CompanionService {
             std::collections::HashSet::new();
         let mut response_text = String::new();
         let mut is_offline = false;
-        let mut agent_loop = AgentLoop::new(user_text, self.config.agent.max_nudges);
+        let max_nudges = if degraded { 0 } else { self.config.agent.max_nudges };
+        let mut agent_loop = AgentLoop::new(user_text, max_nudges);
+
+        // Build AgentSpawnerContext for parallel sub-agent tool
+        let agent_spawner = Some(tools::AgentSpawnerContext {
+            llm: self.llm.clone(),
+            db_path: self.config.yantrikdb.db_path.clone(),
+            embedding_dim: self.config.yantrikdb.embedding_dim,
+            max_steps: 10,
+            max_tokens: self.config.llm.max_tokens,
+            temperature: self.config.llm.temperature,
+            user_name: self.config.user_name.clone(),
+            config: self.config.clone(),
+        });
+
+        // Emit UserMessage event and capture trace for tool call linking
+        let msg_trace = self.event_bus.as_ref().map(|bus| {
+            bus.emit(
+                yantrik_os::EventKind::UserMessage {
+                    text: user_text.chars().take(500).collect(),
+                    source: "handle_message".into(),
+                },
+                yantrik_os::EventSource::UserInterface,
+            )
+        });
 
         // Discovery rounds are limited; actual tool rounds reset the counter.
-        let mut discovery_budget = self.config.tools.max_tool_rounds;
-        let max_total_rounds = self.config.agent.max_steps.max(15);
+        // Max rounds adapt to model capability — smaller models get fewer steps.
+        let mut discovery_budget = if degraded { 0 } else { self.config.tools.max_tool_rounds };
+        let max_total_rounds = if degraded { 3 } else {
+            // Use the minimum of config max_steps and profile max_agent_steps
+            self.config.agent.max_steps.min(active_profile.max_agent_steps).max(3)
+        };
 
         for _round in 0..max_total_rounds {
             // Compute tools_param each iteration — native_tools may grow via discover_tools
@@ -791,9 +995,61 @@ impl CompanionService {
                 }
             };
 
-            // Use native tool_calls if available, fall back to text parsing
+            // Use native tool_calls if available, fall back to text parsing.
+            // For StructuredJSON mode: parse via StructuredDecisionParser first.
             let tool_calls: Vec<ToolCall> = if !llm_response.tool_calls.is_empty() {
                 llm_response.tool_calls.clone()
+            } else if active_profile.tool_call_mode == ToolCallMode::StructuredJSON {
+                // Structured Decision Protocol: parse JSON decision from LLM output
+                match StructuredDecisionParser::parse(&llm_response.text) {
+                    Ok(decision) => {
+                        // Validate the decision
+                        let known_tools: Vec<&str> = selected_tool_names.iter().copied().collect();
+                        let validation = StructuredDecisionValidator::validate(
+                            &decision,
+                            Some(&known_tools),
+                            active_profile.confidence_threshold,
+                        );
+                        match validation {
+                            ValidationResult::Valid | ValidationResult::Repairable(_) => {
+                                if let Some(tc) = decision.to_tool_call() {
+                                    tracing::debug!(
+                                        tool = %tc.name,
+                                        confidence = decision.confidence,
+                                        family = %decision.family,
+                                        "Structured decision → tool call"
+                                    );
+                                    vec![tc]
+                                } else if decision.has_answer() {
+                                    // Direct answer — no tool calls needed
+                                    response_text = decision.answer.clone();
+                                    Vec::new()
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            ValidationResult::Invalid(issues) => {
+                                // Repair attempt: inject repair prompt and retry
+                                if active_profile.supports_repair_loop {
+                                    let repair = RepairPrompt::build(&decision, &issues);
+                                    tracing::debug!(
+                                        issues = issues.len(),
+                                        "Structured decision invalid — injecting repair prompt"
+                                    );
+                                    messages.push(ChatMessage::assistant(&llm_response.text));
+                                    messages.push(ChatMessage::user(&repair));
+                                    continue; // Retry with repair prompt
+                                }
+                                // No repair loop — fall back to text parsing
+                                parse_tool_calls(&llm_response.text)
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Structured parse failed — fall back to standard tool call parsing
+                        parse_tool_calls(&llm_response.text)
+                    }
+                }
             } else {
                 parse_tool_calls(&llm_response.text)
             };
@@ -854,6 +1110,9 @@ impl CompanionService {
                 self.config.agent.error_recovery,
                 self.incognito,
                 self.cortex.as_mut(),
+                agent_spawner.as_ref(),
+                self.event_bus.as_ref(),
+                msg_trace,
             );
 
             if !text_part.is_empty() {
@@ -894,11 +1153,74 @@ impl CompanionService {
                 self.db.conn(), &self.db, user_text,
                 &agent_loop.chain_summary(), outcome,
             );
+            // Trace learning flywheel: record for motif distillation
+            crate::cognitive_router::record_trace(
+                self.db.conn(), user_text, &tool_calls_made,
+                outcome == "success",
+                agent_loop.elapsed_ms(),
+            );
         }
 
         // Clean up tool call XML and Qwen3.5 thinking blocks from final response
         response_text = extract_text_content(&response_text);
         response_text = strip_think_tags(&response_text);
+
+        // Hallucination Firewall — verify factual claims against ground truth
+        // Only active for Medium-tier models (where hallucination_firewall = true)
+        if active_profile.hallucination_firewall && !is_offline {
+            let mut ground_truth = GroundTruth::new();
+
+            // Populate ground truth from active day context
+            for (source_id, content, ts) in self.active_context.to_ground_truth() {
+                ground_truth.add_tool_result(&source_id, &content, ts);
+            }
+
+            // Populate from tool results gathered during this conversation
+            for tool_name in &tool_calls_made {
+                // Tool results are already in the message history — extract from last tool messages
+                for msg in messages.iter().rev().take(20) {
+                    if msg.role == "tool" && msg.content.len() < 2000 {
+                        ground_truth.add_tool_result(tool_name, &msg.content, now_ts() as u64);
+                        break;
+                    }
+                }
+            }
+
+            if !ground_truth.is_empty() {
+                let firewall = HallucinationFirewall::new(FirewallConfig {
+                    enabled: true,
+                    auto_correct: true,
+                    ..Default::default()
+                });
+                let verdict = firewall.check(&response_text, &ground_truth);
+
+                match verdict.action {
+                    FirewallAction::PassThrough => {}
+                    FirewallAction::Correct | FirewallAction::Annotate => {
+                        if let Some(corrected) = verdict.corrected_response {
+                            tracing::info!(
+                                action = %verdict.action,
+                                claims = verdict.claims.len(),
+                                trust = format!("{:.2}", verdict.aggregate_trust),
+                                "Hallucination firewall corrected response"
+                            );
+                            response_text = corrected;
+                        }
+                    }
+                    FirewallAction::Block => {
+                        tracing::warn!(
+                            claims = verdict.claims.len(),
+                            trust = format!("{:.2}", verdict.aggregate_trust),
+                            "Hallucination firewall blocked response"
+                        );
+                        // Don't block entirely — downgrade to annotation with warning
+                        if let Some(corrected) = verdict.corrected_response {
+                            response_text = corrected;
+                        }
+                    }
+                }
+            }
+        }
 
         // SecurityGuard: filter output for sensitive info leaks
         response_text = self.guard.check_response(&response_text, &self.db);
@@ -909,12 +1231,8 @@ impl CompanionService {
         self.conversation_history
             .push(ChatMessage::assistant(&response_text));
 
-        // Trim history to max turns
-        let max = self.config.conversation.max_history_turns * 2;
-        if self.conversation_history.len() > max {
-            let drain = self.conversation_history.len() - max;
-            self.conversation_history.drain(..drain);
-        }
+        // Compress conversation history when it grows too long
+        self.compress_history_if_needed();
 
         self.last_interaction_ts = now_ts();
         self.session_turn_count += 1;
@@ -1063,58 +1381,70 @@ impl CompanionService {
             }
         }
 
-        let personality = self.db.get_personality().ok();
-        let patterns_json: Vec<serde_json::Value> =
-            self.active_patterns.iter().cloned().collect();
+        // Build LLM context — lightweight for degraded mode, full otherwise
+        let degraded = self.llm.is_degraded();
+        if degraded {
+            tracing::info!("LLM degraded (streaming) — lightweight prompt and minimal tools");
+        }
 
-        let narrative_text = Narrative::get(self.db.conn());
-        let style = Evolution::get_style(self.db.conn());
-        let opinions = Evolution::get_opinions(self.db.conn(), 3);
-        let shared_refs = if self.config.memory_evolution.reference_freshness_enabled {
-            memory_evolution::get_fresh_references(self.db.conn(), 3)
+        let context_messages = if degraded {
+            context::build_messages_lightweight(
+                user_text, &self.config, &memories, &self.conversation_history,
+            )
         } else {
-            Evolution::get_shared_references(self.db.conn(), 3)
+            let personality = self.db.get_personality().ok();
+            let patterns_json: Vec<serde_json::Value> =
+                self.active_patterns.iter().cloned().collect();
+            let narrative_text = Narrative::get(self.db.conn());
+            let style = Evolution::get_style(self.db.conn());
+            let opinions = Evolution::get_opinions(self.db.conn(), 3);
+            let shared_refs = if self.config.memory_evolution.reference_freshness_enabled {
+                memory_evolution::get_fresh_references(self.db.conn(), 3)
+            } else {
+                Evolution::get_shared_references(self.db.conn(), 3)
+            };
+            let signals = ContextSignals {
+                self_memories: &self_memories,
+                narrative: &narrative_text,
+                style: &style,
+                opinions: &opinions,
+                shared_refs: &shared_refs,
+                system_state: &self.system_context,
+                recall_confidence,
+                recall_hint: recall_hint.as_deref(),
+            };
+            context::build_messages(
+                user_text, &self.config, &state, &memories, &urges,
+                &patterns_json, &self.conversation_history,
+                personality.as_ref(), Some(&signals), self.use_native_tools,
+            )
         };
-
-        let signals = ContextSignals {
-            self_memories: &self_memories,
-            narrative: &narrative_text,
-            style: &style,
-            opinions: &opinions,
-            shared_refs: &shared_refs,
-            system_state: &self.system_context,
-            recall_confidence,
-            recall_hint: recall_hint.as_deref(),
-        };
-
-        let context_messages = context::build_messages(
-            user_text,
-            &self.config,
-            &state,
-            &memories,
-            &urges,
-            &patterns_json,
-            &self.conversation_history,
-            personality.as_ref(),
-            Some(&signals),
-            self.use_native_tools,
-        );
 
         // Build message array — single system message (Qwen3.5 requires it):
         let max_perm = parse_permission(&self.config.tools.max_permission);
         let mut messages = Vec::with_capacity(context_messages.len() + 1);
 
-        // Dynamic tool selection (same as non-streaming path)
+        // Dynamic tool selection — adaptive based on model capability profile
+        let active_profile = if degraded {
+            ModelCapabilityProfile::degraded()
+        } else {
+            self.capability_profile.clone()
+        };
+
         let word_count = user_text.split_whitespace().count();
         let needs_tools = self.config.tools.enabled && word_count > 2;
         tracing::debug!(
             tools_enabled = self.config.tools.enabled,
             word_count,
             needs_tools,
-            "Tool selection gate"
+            degraded,
+            tier = %active_profile.tier,
+            "Tool selection gate (streaming)"
         );
-        let selected_tool_names: Vec<&str> = if needs_tools {
-            select_tools_for_query(user_text, &self.db, 8)
+        let selected_tool_names: Vec<&str> = if degraded {
+            FALLBACK_TOOLS.to_vec()
+        } else if needs_tools {
+            select_tools_adaptive(user_text, &self.db, &active_profile)
         } else {
             ALWAYS_TOOLS.to_vec()
         };
@@ -1153,8 +1483,8 @@ impl CompanionService {
             messages.extend(context_messages);
         }
 
-        // Tool chain learning: inject trace hints into system prompt
-        if self.config.agent.trace_learning && self.config.tools.enabled {
+        // Tool chain learning: inject trace hints (skip in degraded mode)
+        if !degraded && self.config.agent.trace_learning && self.config.tools.enabled {
             let hints = ToolTraces::find_similar(
                 self.db.conn(), &self.db, user_text, 3,
                 self.config.agent.trace_min_similarity,
@@ -1170,12 +1500,30 @@ impl CompanionService {
             }
         }
 
+        // Inject Active Day Context into system prompt (budget from capability profile)
+        if active_profile.ambient_context_budget > 0 {
+            self.active_context.prune_stale();
+            if let Some(context_block) = self.active_context.build_context_block(
+                active_profile.ambient_context_budget,
+            ) {
+                if let Some(sys_msg) = messages.first_mut() {
+                    sys_msg.content.push_str("\n\n");
+                    sys_msg.content.push_str(&context_block);
+                }
+            }
+        }
+
         // Step 7: Call LLM with streaming + robust agent loop
-        let gen_config = GenerationConfig {
-            max_tokens: self.config.llm.max_tokens,
-            temperature: self.config.llm.temperature,
-            top_p: Some(0.9),
-            ..Default::default()
+        // Generation config adapts to model capability profile
+        let gen_config = if degraded {
+            active_profile.tool_gen_config()
+        } else {
+            GenerationConfig {
+                max_tokens: self.config.llm.max_tokens.min(active_profile.max_generation_tokens),
+                temperature: self.config.llm.temperature,
+                top_p: Some(0.9),
+                ..Default::default()
+            }
         };
 
         let mut tool_calls_made = Vec::new();
@@ -1183,7 +1531,31 @@ impl CompanionService {
             std::collections::HashSet::new();
         let mut response_text: String;
         let mut is_offline = false;
-        let mut agent_loop = AgentLoop::new(user_text, self.config.agent.max_nudges);
+        let max_nudges = if degraded { 0 } else { self.config.agent.max_nudges };
+        let mut agent_loop = AgentLoop::new(user_text, max_nudges);
+
+        // Build AgentSpawnerContext for parallel sub-agent tool
+        let agent_spawner = Some(tools::AgentSpawnerContext {
+            llm: self.llm.clone(),
+            db_path: self.config.yantrikdb.db_path.clone(),
+            embedding_dim: self.config.yantrikdb.embedding_dim,
+            max_steps: 10,
+            max_tokens: self.config.llm.max_tokens,
+            temperature: self.config.llm.temperature,
+            user_name: self.config.user_name.clone(),
+            config: self.config.clone(),
+        });
+
+        // Emit UserMessage event and capture trace for tool call linking
+        let msg_trace = self.event_bus.as_ref().map(|bus| {
+            bus.emit(
+                yantrik_os::EventKind::UserMessage {
+                    text: user_text.chars().take(500).collect(),
+                    source: "handle_message_streaming".into(),
+                },
+                yantrik_os::EventSource::UserInterface,
+            )
+        });
 
         // Round 1: streaming
         let mut streamed_text = String::new();
@@ -1204,9 +1576,37 @@ impl CompanionService {
             Ok(r) => {
                 let full_text = if !streamed_text.is_empty() { &streamed_text } else { &r.text };
 
-                // Use native tool_calls if available, fall back to text parsing
+                // Use native tool_calls if available, fall back to text parsing.
+                // For StructuredJSON mode: parse via StructuredDecisionParser first.
                 let tool_calls: Vec<ToolCall> = if !r.tool_calls.is_empty() {
                     r.tool_calls.clone()
+                } else if active_profile.tool_call_mode == ToolCallMode::StructuredJSON {
+                    match StructuredDecisionParser::parse(full_text) {
+                        Ok(decision) => {
+                            let known_tools: Vec<&str> = selected_tool_names.iter().copied().collect();
+                            let validation = StructuredDecisionValidator::validate(
+                                &decision, Some(&known_tools), active_profile.confidence_threshold,
+                            );
+                            match validation {
+                                ValidationResult::Valid | ValidationResult::Repairable(_) => {
+                                    if let Some(tc) = decision.to_tool_call() {
+                                        vec![tc]
+                                    } else if decision.has_answer() {
+                                        response_text = decision.answer.clone();
+                                        Vec::new()
+                                    } else {
+                                        Vec::new()
+                                    }
+                                }
+                                ValidationResult::Invalid(_issues) => {
+                                    // In streaming path, repair loop defers to the non-streaming
+                                    // follow-up rounds. Fall back to standard text parsing.
+                                    parse_tool_calls(full_text)
+                                }
+                            }
+                        }
+                        Err(_) => parse_tool_calls(full_text),
+                    }
                 } else {
                     parse_tool_calls(full_text)
                 };
@@ -1269,13 +1669,18 @@ impl CompanionService {
                         self.config.agent.error_recovery,
                         self.incognito,
                         self.cortex.as_mut(),
+                        agent_spawner.as_ref(),
+                        self.event_bus.as_ref(),
+                        msg_trace,
                     );
 
                     // Remaining rounds: discovery rounds are budget-limited,
                     // actual tool rounds run until the hard cap.
                     response_text = display_text.clone();
-                    let mut discovery_budget = self.config.tools.max_tool_rounds.saturating_sub(1);
-                    let max_total_rounds = self.config.agent.max_steps.max(15);
+                    let mut discovery_budget = if degraded { 0 } else { self.config.tools.max_tool_rounds.saturating_sub(1) };
+                    let max_total_rounds = if degraded { 2 } else {
+                        self.config.agent.max_steps.min(active_profile.max_agent_steps).max(3)
+                    };
 
                     for _round in 0..max_total_rounds {
                         let tools_param: Option<&[serde_json::Value]> = if self.use_native_tools && !native_tools.is_empty() {
@@ -1363,6 +1768,9 @@ impl CompanionService {
                                     self.config.agent.error_recovery,
                                     self.incognito,
                                     self.cortex.as_mut(),
+                                    agent_spawner.as_ref(),
+                                    self.event_bus.as_ref(),
+                                    msg_trace,
                                 );
 
                                 if !round_text.is_empty() {
@@ -1449,10 +1857,53 @@ impl CompanionService {
                 self.db.conn(), &self.db, user_text,
                 &agent_loop.chain_summary(), outcome,
             );
+            // Trace learning flywheel: record for motif distillation
+            crate::cognitive_router::record_trace(
+                self.db.conn(), user_text, &tool_calls_made,
+                outcome == "success",
+                agent_loop.elapsed_ms(),
+            );
         }
 
         response_text = extract_text_content(&response_text);
         response_text = strip_think_tags(&response_text);
+
+        // Hallucination Firewall — verify factual claims against ground truth (streaming path)
+        if active_profile.hallucination_firewall && !is_offline {
+            let mut ground_truth = GroundTruth::new();
+            for (source_id, content, ts) in self.active_context.to_ground_truth() {
+                ground_truth.add_tool_result(&source_id, &content, ts);
+            }
+            for tool_name in &tool_calls_made {
+                for msg in messages.iter().rev().take(20) {
+                    if msg.role == "tool" && msg.content.len() < 2000 {
+                        ground_truth.add_tool_result(tool_name, &msg.content, now_ts() as u64);
+                        break;
+                    }
+                }
+            }
+            if !ground_truth.is_empty() {
+                let firewall = HallucinationFirewall::new(FirewallConfig {
+                    enabled: true,
+                    auto_correct: true,
+                    ..Default::default()
+                });
+                let verdict = firewall.check(&response_text, &ground_truth);
+                match verdict.action {
+                    FirewallAction::PassThrough => {}
+                    FirewallAction::Correct | FirewallAction::Annotate | FirewallAction::Block => {
+                        if let Some(corrected) = verdict.corrected_response {
+                            tracing::info!(
+                                action = %verdict.action,
+                                trust = format!("{:.2}", verdict.aggregate_trust),
+                                "Hallucination firewall corrected streaming response"
+                            );
+                            response_text = corrected;
+                        }
+                    }
+                }
+            }
+        }
 
         // SecurityGuard: filter output for sensitive info leaks
         response_text = self.guard.check_response(&response_text, &self.db);
@@ -1462,11 +1913,8 @@ impl CompanionService {
         self.conversation_history
             .push(ChatMessage::assistant(&response_text));
 
-        let max = self.config.conversation.max_history_turns * 2;
-        if self.conversation_history.len() > max {
-            let drain = self.conversation_history.len() - max;
-            self.conversation_history.drain(..drain);
-        }
+        // Compress conversation history when it grows too long
+        self.compress_history_if_needed();
 
         self.last_interaction_ts = now_ts();
         self.session_turn_count += 1;
@@ -1672,12 +2120,8 @@ impl CompanionService {
 
         // Add to conversation history so the LLM remembers what it said
         self.conversation_history.push(ChatMessage::assistant(text));
-        // Keep conversation history bounded
-        let max = 30;
-        if self.conversation_history.len() > max {
-            let drain = self.conversation_history.len() - max;
-            self.conversation_history.drain(..drain);
-        }
+        // Compress conversation history if needed
+        self.compress_history_if_needed();
 
         // Track daily count
         let now = now_ts();
@@ -1825,6 +2269,69 @@ impl CompanionService {
     /// Get conversation history.
     pub fn history(&self) -> &[ChatMessage] {
         &self.conversation_history
+    }
+
+    /// Compress conversation history when it exceeds the configured limit.
+    ///
+    /// Instead of simply dropping old messages, summarizes the older half
+    /// into a single context message using the LLM. This preserves key
+    /// information while freeing context window space.
+    fn compress_history_if_needed(&mut self) {
+        let max = self.config.conversation.max_history_turns * 2;
+        if self.conversation_history.len() <= max {
+            return;
+        }
+
+        // Split: older half gets compressed, recent half stays verbatim
+        let split = self.conversation_history.len() / 2;
+        // Round to even (user+assistant pairs)
+        let split = split - (split % 2);
+
+        if split < 4 {
+            // Too few messages to compress — just truncate
+            let drain = self.conversation_history.len() - max;
+            self.conversation_history.drain(..drain);
+            return;
+        }
+
+        let old_messages = &self.conversation_history[..split];
+
+        // Build summary text from old messages (without LLM call for speed)
+        let mut summary_parts = Vec::new();
+        for pair in old_messages.chunks(2) {
+            if pair.len() == 2 {
+                let user_text = &pair[0].content;
+                let asst_text = &pair[1].content;
+                // Truncate each turn to keep summary compact
+                let user_short = if user_text.len() > 150 {
+                    format!("{}...", &user_text[..user_text.floor_char_boundary(150)])
+                } else {
+                    user_text.clone()
+                };
+                let asst_short = if asst_text.len() > 200 {
+                    format!("{}...", &asst_text[..asst_text.floor_char_boundary(200)])
+                } else {
+                    asst_text.clone()
+                };
+                summary_parts.push(format!("User: {}\nAssistant: {}", user_short, asst_short));
+            }
+        }
+
+        let summary = format!(
+            "[Earlier conversation summary ({} turns compressed)]\n{}",
+            split / 2,
+            summary_parts.join("\n---\n")
+        );
+
+        // Replace old messages with a single summary message
+        self.conversation_history.drain(..split);
+        self.conversation_history.insert(0, ChatMessage::system(&summary));
+
+        tracing::debug!(
+            compressed = split / 2,
+            remaining = self.conversation_history.len(),
+            "Conversation history compressed"
+        );
     }
 
     /// Seconds since last interaction.
@@ -1986,6 +2493,7 @@ fn execute_tool_round(
         registry_metadata: None,
         task_manager: Some(task_manager),
         incognito,
+        agent_spawner: None,
     };
 
     for (idx, (name, args)) in tool_calls.iter().enumerate() {
@@ -2000,6 +2508,7 @@ fn execute_tool_round(
                 registry_metadata: Some(&metadata),
                 task_manager: Some(task_manager),
                 incognito,
+                agent_spawner: None,
             };
             registry.execute(&disc_ctx, name, args)
         } else {
@@ -2094,6 +2603,9 @@ fn execute_tool_round_tracked(
     error_recovery: bool,
     incognito: bool,
     mut cortex: Option<&mut crate::cortex::ContextCortex>,
+    agent_spawner: Option<&tools::AgentSpawnerContext>,
+    event_bus: Option<&yantrik_os::EventBus>,
+    parent_trace: Option<yantrik_os::TraceId>,
 ) {
     let ctx = ToolContext {
         db,
@@ -2101,6 +2613,7 @@ fn execute_tool_round_tracked(
         registry_metadata: None,
         task_manager: Some(task_manager),
         incognito,
+        agent_spawner,
     };
 
     for (idx, (name, args)) in tool_calls.iter().enumerate() {
@@ -2121,6 +2634,35 @@ fn execute_tool_round_tracked(
             continue;
         }
 
+        // Emit ToolCalled event
+        let tool_trace = if let Some(bus) = event_bus {
+            let trace = if let Some(parent) = parent_trace {
+                bus.emit_with_parent(
+                    yantrik_os::EventKind::ToolCalled {
+                        tool_name: name.clone(),
+                        arguments: args.clone(),
+                        permission: format!("{:?}", max_perm),
+                    },
+                    yantrik_os::EventSource::ToolExecutor,
+                    parent,
+                )
+            } else {
+                bus.emit(
+                    yantrik_os::EventKind::ToolCalled {
+                        tool_name: name.clone(),
+                        arguments: args.clone(),
+                        permission: format!("{:?}", max_perm),
+                    },
+                    yantrik_os::EventSource::ToolExecutor,
+                )
+            };
+            Some(trace)
+        } else {
+            None
+        };
+
+        let tool_start = std::time::Instant::now();
+
         // Execute the tool
         let result = if name == "discover_tools" {
             let metadata = registry.list_metadata(max_perm);
@@ -2130,20 +2672,88 @@ fn execute_tool_round_tracked(
                 registry_metadata: Some(&metadata),
                 task_manager: Some(task_manager),
                 incognito,
+                agent_spawner,
             };
             registry.execute(&disc_ctx, name, args)
         } else {
             registry.execute(&ctx, name, args)
         };
 
+        let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
+
         guard.check_tool_result(name, &result, db);
+
+        // MCP security: check if this tool call was potentially manipulated by
+        // a previous MCP server response (follow-up action blocking)
+        let last_mcp = tool_calls_made.iter().rev().skip(1)
+            .find(|t| t.starts_with("mcp__"))
+            .and_then(|t| t.strip_prefix("mcp__"))
+            .and_then(|t| t.split('_').next())
+            .map(|s| s.to_string());
+        if !name.starts_with("mcp__") {
+            if let Some(ref mcp_server) = last_mcp {
+                if let Ok(scanner) = tools::mcp::security_scanner().lock() {
+                    if let Some(block_msg) = scanner.scan_llm_follow_up(name, args, Some(mcp_server)) {
+                        tracing::warn!(
+                            tool = name,
+                            mcp_server = %mcp_server,
+                            "MCP follow-up action blocked"
+                        );
+                        let result = format!("Security: {}", block_msg);
+                        if use_native_tools {
+                            let call_id = api_tool_calls.get(idx)
+                                .map(|tc| tc.id.as_str())
+                                .unwrap_or("call_security");
+                            messages.push(ChatMessage::tool(call_id, name, &result));
+                        } else {
+                            messages.push(ChatMessage::user(&format!("[tool result: {}] {}", name, result)));
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
 
         // Determine success/failure for agent loop tracking
         let is_error = result.starts_with("Error:")
             || result.starts_with("error:")
             || result.starts_with("Permission denied")
             || result.starts_with("Tool not found")
-            || result.starts_with("BLOCKED");
+            || result.starts_with("BLOCKED")
+            || result.starts_with("Security:");
+
+        // Emit ToolCompleted event with outcome (postcondition verification)
+        if let (Some(bus), Some(trace)) = (event_bus, tool_trace) {
+            let outcome = if is_error {
+                yantrik_os::ToolOutcome::Failed {
+                    error: result.chars().take(200).collect(),
+                }
+            } else {
+                verify_postcondition(name, args, &result)
+            };
+            let preview: String = result.chars().take(200).collect();
+            bus.emit_with_parent(
+                yantrik_os::EventKind::ToolCompleted {
+                    tool_name: name.clone(),
+                    outcome,
+                    duration_ms: tool_duration_ms,
+                    result_preview: preview,
+                },
+                yantrik_os::EventSource::ToolExecutor,
+                trace,
+            );
+        }
+
+        // Record tool reliability metrics
+        let failure_reason = if is_error {
+            Some(result.chars().take(200).collect::<String>())
+        } else {
+            None
+        };
+        crate::tool_metrics::ToolMetrics::record(
+            db.conn(), name, !is_error, tool_duration_ms,
+            failure_reason.as_deref(),
+        );
 
         // Record step in agent loop
         agent_loop.record_step(name, args, &result, !is_error);
@@ -2242,6 +2852,162 @@ fn parse_discovered_tool_names(
         }
     }
     names
+}
+
+/// Postcondition verification for tool results.
+///
+/// For tools with verifiable outcomes, checks that the result contains
+/// expected success markers. Returns `Verified` if postcondition is met,
+/// `PartialSuccess` if ambiguous, or `Unverified` for tools without
+/// postcondition definitions.
+fn verify_postcondition(
+    tool_name: &str,
+    _args: &serde_json::Value,
+    result: &str,
+) -> yantrik_os::ToolOutcome {
+    use yantrik_os::ToolOutcome;
+
+    match tool_name {
+        // Memory tools — verify storage confirmation
+        "remember" => {
+            if result.contains("Stored") || result.contains("stored")
+                || result.contains("Remembered") || result.contains("saved")
+            {
+                ToolOutcome::Verified
+            } else {
+                ToolOutcome::PartialSuccess {
+                    detail: "Memory store returned but no confirmation marker".into(),
+                }
+            }
+        }
+        "recall" => {
+            // Recall always "succeeds" — even empty results are valid
+            ToolOutcome::Verified
+        }
+
+        // File tools — verify operation markers
+        "write_file" | "edit_file" => {
+            if result.contains("Written") || result.contains("written")
+                || result.contains("Saved") || result.contains("saved")
+                || result.contains("Updated") || result.contains("updated")
+                || result.contains("Edited") || result.contains("edited")
+                || result.contains("Created") || result.contains("created")
+            {
+                ToolOutcome::Verified
+            } else {
+                ToolOutcome::PartialSuccess {
+                    detail: "File operation returned but no write confirmation".into(),
+                }
+            }
+        }
+        "read_file" | "glob" | "grep" => {
+            // Read operations succeed if they return content
+            if !result.is_empty() {
+                ToolOutcome::Verified
+            } else {
+                ToolOutcome::PartialSuccess {
+                    detail: "File read returned empty content".into(),
+                }
+            }
+        }
+
+        // Command execution — check for exit code markers
+        "run_command" | "code_execute" => {
+            if result.contains("exit code: 0") || result.contains("Exit code: 0")
+                || (!result.contains("exit code:") && !result.contains("Exit code:"))
+            {
+                // No exit code mentioned = likely succeeded (output only)
+                ToolOutcome::Verified
+            } else {
+                ToolOutcome::PartialSuccess {
+                    detail: "Command completed with non-zero exit code".into(),
+                }
+            }
+        }
+
+        // Email tools — verify send confirmation
+        "email_send" | "email_reply" => {
+            if result.contains("sent") || result.contains("Sent")
+                || result.contains("delivered") || result.contains("queued")
+            {
+                ToolOutcome::Verified
+            } else {
+                ToolOutcome::PartialSuccess {
+                    detail: "Email operation returned but no send confirmation".into(),
+                }
+            }
+        }
+        "email_check" | "email_list" | "email_read" | "email_search" => {
+            ToolOutcome::Verified
+        }
+
+        // Browser tools — snapshot/navigate verification
+        "browse" | "browser_snapshot" | "browser_see" => {
+            if result.len() > 50 {
+                ToolOutcome::Verified
+            } else {
+                ToolOutcome::PartialSuccess {
+                    detail: "Browser returned minimal content".into(),
+                }
+            }
+        }
+
+        // Network tools
+        "web_fetch" | "http_fetch" => {
+            if result.len() > 20 && !result.contains("Connection refused")
+                && !result.contains("timed out")
+            {
+                ToolOutcome::Verified
+            } else {
+                ToolOutcome::PartialSuccess {
+                    detail: "Fetch returned but may have connectivity issues".into(),
+                }
+            }
+        }
+        "web_search" => {
+            if result.contains("http") || result.contains("result") || result.len() > 100 {
+                ToolOutcome::Verified
+            } else {
+                ToolOutcome::PartialSuccess {
+                    detail: "Search returned but results may be empty".into(),
+                }
+            }
+        }
+
+        // System tools — always verified (info queries)
+        "system_info" | "disk_usage" | "list_processes" | "date_calc"
+        | "calculate" | "discover_tools" | "check_bond" | "get_weather"
+        | "screenshot" | "list_files" | "search_files" => {
+            ToolOutcome::Verified
+        }
+
+        // Vault tools
+        "vault_store" | "vault_set_pin" => {
+            if result.contains("Stored") || result.contains("stored")
+                || result.contains("Set") || result.contains("set")
+            {
+                ToolOutcome::Verified
+            } else {
+                ToolOutcome::PartialSuccess {
+                    detail: "Vault operation completed but no confirmation".into(),
+                }
+            }
+        }
+
+        // Delegation
+        "spawn_agents" | "claude_think" | "claude_code" => {
+            if result.len() > 50 {
+                ToolOutcome::Verified
+            } else {
+                ToolOutcome::PartialSuccess {
+                    detail: "Agent delegation returned minimal output".into(),
+                }
+            }
+        }
+
+        // Default — no postcondition defined
+        _ => ToolOutcome::Unverified,
+    }
 }
 
 fn now_ts() -> f64 {

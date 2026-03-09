@@ -83,6 +83,63 @@ pub struct LLMConfig {
     pub temperature: f64,
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
+
+    /// Fallback model configuration — used when primary LLM is unavailable.
+    #[serde(default)]
+    pub fallback: Option<FallbackModelConfig>,
+}
+
+/// Configuration for the fallback (offline) LLM model.
+///
+/// When the primary LLM fails, Yantrik falls back to a local model
+/// for basic intelligence. Two modes:
+///
+/// **API mode** — runs llama-server locally and connects via OpenAI API:
+/// ```yaml
+/// fallback:
+///   backend: "api"
+///   api_base_url: "http://localhost:8341/v1"
+///   api_model: "qwen3.5-0.8b"
+/// ```
+///
+/// **llamacpp mode** — embedded llama.cpp (requires `llamacpp` feature):
+/// ```yaml
+/// fallback:
+///   backend: "llamacpp"
+///   model_path: "/path/to/model.gguf"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FallbackModelConfig {
+    /// Fallback backend: "api" (local llama-server) or "llamacpp" (embedded).
+    #[serde(default = "default_fallback_backend")]
+    pub backend: String,
+    /// Path to the GGUF model file (for llamacpp backend).
+    #[serde(default)]
+    pub model_path: Option<String>,
+    /// API base URL (for api backend, e.g. "http://localhost:8341/v1").
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    /// Model name for API backend.
+    #[serde(default)]
+    pub api_model: Option<String>,
+    /// Number of layers to offload to GPU (llamacpp only). 99 = all, 0 = CPU only.
+    #[serde(default = "default_fallback_gpu_layers")]
+    pub n_gpu_layers: u32,
+    /// Context window size for the fallback model.
+    #[serde(default = "default_fallback_context_size")]
+    pub context_size: u32,
+}
+
+fn default_fallback_backend() -> String {
+    "api".to_string()
+}
+
+fn default_fallback_gpu_layers() -> u32 {
+    99
+}
+
+fn default_fallback_context_size() -> u32 {
+    4096
 }
 
 fn default_backend() -> String {
@@ -98,13 +155,13 @@ fn default_hub_tokenizer() -> String {
     "Qwen/Qwen2.5-0.5B-Instruct".to_string()
 }
 fn default_max_tokens() -> usize {
-    256
+    2048
 }
 fn default_temperature() -> f64 {
     0.7
 }
 fn default_max_context_tokens() -> usize {
-    1024
+    4096
 }
 
 impl Default for LLMConfig {
@@ -123,6 +180,7 @@ impl Default for LLMConfig {
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             max_context_tokens: default_max_context_tokens(),
+            fallback: None,
         }
     }
 }
@@ -575,7 +633,7 @@ pub struct InstinctSettings {
 }
 
 fn default_check_in_hours() -> f64 {
-    6.0
+    2.0
 }
 fn default_follow_up_hours() -> f64 {
     4.0
@@ -614,10 +672,10 @@ fn default_identity_thread_interval() -> f64 { 168.0 } // ~weekly
 fn default_myth_buster_interval() -> f64 { 8.0 }
 fn default_cooking_companion_interval() -> f64 { 6.0 }
 fn default_second_brain_interval() -> f64 { 12.0 }
-fn default_health_pulse_interval() -> f64 { 8.0 }
+fn default_health_pulse_interval() -> f64 { 4.0 }
 fn default_money_mind_interval() -> f64 { 12.0 }
-fn default_relationship_radar_interval() -> f64 { 24.0 }
-fn default_goal_keeper_interval() -> f64 { 48.0 }
+fn default_relationship_radar_interval() -> f64 { 6.0 }
+fn default_goal_keeper_interval() -> f64 { 6.0 }
 fn default_decision_lab_interval() -> f64 { 8.0 }
 fn default_skill_forge_interval() -> f64 { 12.0 }
 fn default_time_capture_interval() -> f64 { 12.0 }
@@ -947,6 +1005,35 @@ impl Default for TelegramConfig {
     }
 }
 
+// ── WhatsApp Config ────────────────────────────────────────────────────────
+
+/// WhatsApp Business API configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhatsAppConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// WhatsApp Business phone number ID (from Meta Business).
+    #[serde(default)]
+    pub phone_number_id: Option<String>,
+    /// Permanent access token (from Meta Business).
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// Default recipient phone number in international format.
+    #[serde(default)]
+    pub recipient: Option<String>,
+}
+
+impl Default for WhatsAppConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phone_number_id: None,
+            access_token: None,
+            recipient: None,
+        }
+    }
+}
+
 // ── Memory Evolution Config ─────────────────────────────────────────────────
 
 /// Configuration for memory evolution features (V23).
@@ -1226,6 +1313,8 @@ pub struct CompanionConfig {
     #[serde(default)]
     pub telegram: TelegramConfig,
     #[serde(default)]
+    pub whatsapp: WhatsAppConfig,
+    #[serde(default)]
     pub memory_evolution: MemoryEvolutionConfig,
     #[serde(default)]
     pub agent: AgentConfig,
@@ -1237,6 +1326,10 @@ pub struct CompanionConfig {
     pub connectors: ConnectorsConfig,
     #[serde(default)]
     pub vault: VaultConfig,
+    /// MCP (Model Context Protocol) servers to connect to at startup.
+    /// Each server exposes tools that become available to the companion.
+    #[serde(default)]
+    pub mcp_servers: Vec<crate::tools::mcp::McpServerEntry>,
     /// Services the user actually uses. Only cortex rules and instincts for
     /// enabled services will fire. Examples: "email", "calendar", "git", "jira".
     /// If empty, defaults to a minimal personal set.
@@ -1269,6 +1362,9 @@ pub struct ConnectorsConfig {
     /// Set facebook_app_id to enable both.
     #[serde(default)]
     pub instagram_app_id: Option<String>,
+    /// GitHub personal access token (optional — increases API rate limit from 60 to 5000/hr).
+    #[serde(default)]
+    pub github_token: Option<String>,
     /// Background sync interval in minutes (default: 30).
     #[serde(default = "default_connector_sync_interval")]
     pub sync_interval_minutes: u32,
@@ -1316,6 +1412,7 @@ impl Default for ConnectorsConfig {
             facebook_app_id: None,
             facebook_app_secret: None,
             instagram_app_id: None,
+            github_token: None,
             sync_interval_minutes: default_connector_sync_interval(),
         }
     }
@@ -1355,12 +1452,14 @@ impl Default for CompanionConfig {
             home_assistant: HomeAssistantConfig::default(),
             proactive: ProactiveConfig::default(),
             telegram: TelegramConfig::default(),
+            whatsapp: WhatsAppConfig::default(),
             memory_evolution: MemoryEvolutionConfig::default(),
             agent: AgentConfig::default(),
             email: EmailConfig::default(),
             calendar: CalendarConfig::default(),
             connectors: ConnectorsConfig::default(),
             vault: VaultConfig::default(),
+            mcp_servers: Vec::new(),
             enabled_services: default_enabled_services(),
         }
     }
