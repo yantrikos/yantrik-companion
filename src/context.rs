@@ -28,6 +28,8 @@ pub struct ContextSignals<'a> {
     pub recall_confidence: f64,
     /// Hint for the LLM when confidence is low.
     pub recall_hint: Option<&'a str>,
+    /// CK-5 cognitive awareness — narrative arcs, patterns, beliefs, style.
+    pub ck5_awareness: Option<String>,
 }
 
 /// Build a minimal message array for degraded/fallback LLM (tiny model).
@@ -174,12 +176,21 @@ fn build_system_prompt(
     // Budget check macro: skip sections when prompt is full
     let over_budget = |p: &str| estimate_tokens(p) >= max_prompt_tokens;
 
-    // ── 4. Current time ──
+    // ── 3b. Behavioral rules ──
+    if !over_budget(&prompt) {
+        prompt.push_str(
+            "When the user corrects you, dismisses an alert, or says something is a false alarm, \
+             always use the remember tool to store their preference so you don't repeat the mistake.\n\n"
+        );
+    }
+
+    // ── 4. Current time (compact — ~8 tokens) ──
     if !over_budget(&prompt) {
         let now = chrono::Local::now();
         prompt.push_str(&format!(
-            "Current time: {}\n\n",
-            now.format("%A, %B %d %I:%M %p")
+            "Time: {} ({})\n\n",
+            now.format("%Y-%m-%d %H:%M %Z"),
+            now.format("%A"),
         ));
     }
 
@@ -262,6 +273,19 @@ fn build_system_prompt(
                 };
                 prompt.push_str(&sanitize::escape_for_prompt(n));
                 prompt.push_str("\n\n");
+            }
+        }
+    }
+
+    // ── 7b. CK-5 Cognitive awareness (arcs, patterns, beliefs, style) ──
+    if let Some(s) = signals {
+        if !over_budget(&prompt) {
+            if let Some(ref ck5) = s.ck5_awareness {
+                if !ck5.is_empty() {
+                    prompt.push_str("Your cognitive awareness:\n");
+                    prompt.push_str(&sanitize::escape_for_prompt(ck5));
+                    prompt.push('\n');
+                }
             }
         }
     }

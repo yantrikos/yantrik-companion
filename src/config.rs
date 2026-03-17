@@ -87,6 +87,55 @@ pub struct LLMConfig {
     /// Fallback model configuration — used when primary LLM is unavailable.
     #[serde(default)]
     pub fallback: Option<FallbackModelConfig>,
+
+    /// Configured LLM providers (multi-provider support).
+    /// When present, these override the flat backend/api_base_url/api_key fields.
+    /// The flat fields are kept for backward compatibility and single-provider setups.
+    #[serde(default)]
+    pub providers: Vec<ProviderEntry>,
+}
+
+/// A configured LLM provider endpoint.
+///
+/// Supports all major providers: Ollama (local), OpenAI, Anthropic, OpenRouter,
+/// Google Gemini, Together, Groq, Fireworks, Mistral, DeepSeek, HuggingFace,
+/// and any OpenAI-compatible custom endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEntry {
+    /// Unique identifier (e.g. "ollama-local", "openai-main").
+    pub id: String,
+    /// Display name (e.g. "Ollama (Local)", "OpenAI").
+    pub name: String,
+    /// Provider type — determines default URL, auth, and capabilities.
+    /// Known types: "ollama", "openai", "anthropic", "openrouter", "gemini",
+    /// "together", "groq", "fireworks", "mistral", "deepseek", "huggingface", "custom"
+    #[serde(default = "default_provider_type")]
+    pub provider_type: String,
+    /// API base URL (e.g. "http://localhost:11434/v1", "https://api.openai.com/v1").
+    pub base_url: String,
+    /// API key (required for most cloud providers, optional for Ollama).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Authentication type: "bearer" (most providers), "x-api-key" (Anthropic), "none" (Ollama).
+    #[serde(default = "default_auth_type")]
+    pub auth_type: String,
+    /// Currently selected model name for this provider.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Whether this is the primary provider.
+    #[serde(default)]
+    pub is_primary: bool,
+    /// Whether this is the fallback provider.
+    #[serde(default)]
+    pub is_fallback: bool,
+}
+
+fn default_provider_type() -> String {
+    "custom".to_string()
+}
+
+fn default_auth_type() -> String {
+    "bearer".to_string()
 }
 
 /// Configuration for the fallback (offline) LLM model.
@@ -181,6 +230,7 @@ impl Default for LLMConfig {
             temperature: default_temperature(),
             max_context_tokens: default_max_context_tokens(),
             fallback: None,
+            providers: Vec::new(),
         }
     }
 }
@@ -1279,6 +1329,76 @@ impl Default for AgentConfig {
     }
 }
 
+/// CK-5 Generative Understanding configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CK5Config {
+    /// Master switch for all CK-5 primitives.
+    #[serde(default = "default_ck5_true")]
+    pub enabled: bool,
+    /// Enable perspective engine (shift detection, cognitive style).
+    #[serde(default = "default_ck5_true")]
+    pub perspective_enabled: bool,
+    /// Check for perspective conflicts each cycle.
+    #[serde(default = "default_ck5_true")]
+    pub perspective_conflict_check: bool,
+    /// Enable schema induction (observe episodes, match patterns).
+    #[serde(default = "default_ck5_true")]
+    pub schema_induction_enabled: bool,
+    /// Enable narrative arc tracking.
+    #[serde(default = "default_ck5_true")]
+    pub narrative_enabled: bool,
+    /// Enable experience replay / dream cycles.
+    #[serde(default = "default_ck5_true")]
+    pub replay_enabled: bool,
+    /// Enable belief network propagation and health checks.
+    #[serde(default = "default_ck5_true")]
+    pub belief_network_enabled: bool,
+    /// Enable analogical reasoning maintenance.
+    #[serde(default = "default_ck5_true")]
+    pub analogy_enabled: bool,
+    /// Enable counterfactual reasoning / regret detection.
+    #[serde(default = "default_ck5_true")]
+    pub counterfactual_enabled: bool,
+    /// Idle time (seconds) before medium-intensity ops fire.
+    #[serde(default = "default_ck5_idle")]
+    pub idle_threshold_secs: f64,
+    /// Idle time (seconds) before deep-idle ops fire (dream, analogy, regret).
+    #[serde(default = "default_ck5_deep_idle")]
+    pub deep_idle_threshold_secs: f64,
+    /// Max age (ms) for analogy mappings before pruning.
+    #[serde(default = "default_ck5_analogy_age")]
+    pub analogy_max_age_ms: u64,
+    /// Max age (ms) for induced schemas before pruning.
+    #[serde(default = "default_ck5_schema_age")]
+    pub schema_max_age_ms: u64,
+}
+
+fn default_ck5_true() -> bool { true }
+fn default_ck5_idle() -> f64 { 300.0 }       // 5 minutes
+fn default_ck5_deep_idle() -> f64 { 1800.0 }  // 30 minutes
+fn default_ck5_analogy_age() -> u64 { 30 * 24 * 3600 * 1000 }  // 30 days
+fn default_ck5_schema_age() -> u64 { 60 * 24 * 3600 * 1000 }   // 60 days
+
+impl Default for CK5Config {
+    fn default() -> Self {
+        Self {
+            enabled: default_ck5_true(),
+            perspective_enabled: default_ck5_true(),
+            perspective_conflict_check: default_ck5_true(),
+            schema_induction_enabled: default_ck5_true(),
+            narrative_enabled: default_ck5_true(),
+            replay_enabled: default_ck5_true(),
+            belief_network_enabled: default_ck5_true(),
+            analogy_enabled: default_ck5_true(),
+            counterfactual_enabled: default_ck5_true(),
+            idle_threshold_secs: default_ck5_idle(),
+            deep_idle_threshold_secs: default_ck5_deep_idle(),
+            analogy_max_age_ms: default_ck5_analogy_age(),
+            schema_max_age_ms: default_ck5_schema_age(),
+        }
+    }
+}
+
 /// Top-level companion configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompanionConfig {
@@ -1339,6 +1459,9 @@ pub struct CompanionConfig {
     /// If empty, defaults to a minimal personal set.
     #[serde(default = "default_enabled_services")]
     pub enabled_services: Vec<String>,
+    /// CK-5 Generative Understanding — cognitive primitives config.
+    #[serde(default)]
+    pub ck5: CK5Config,
 }
 
 /// OAuth connector configuration for external services.
@@ -1465,6 +1588,7 @@ impl Default for CompanionConfig {
             vault: VaultConfig::default(),
             mcp_servers: Vec::new(),
             enabled_services: default_enabled_services(),
+            ck5: CK5Config::default(),
         }
     }
 }
