@@ -1,0 +1,19 @@
+[package]
+name = "yantrikdb-server"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP server for Yantrik companion (replaces Python FastAPI service)"
+
+[dependencies]
+yantrik-companion = { workspace = true }
+yantrik-ml = { workspace = true }
+yantrikdb-core = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+futures = "0.3"
+tokio-stream = "0.1"

@@ -1,0 +1,39 @@
+[package]
+name = "yantrik"
+version = "0.1.0"
+edition = "2021"
+description = "Yantrik — single-binary personal AI companion"
+
+[[bin]]
+name = "yantrik"
+path = "src/main.rs"
+
+[dependencies]
+yantrik-companion = { workspace = true }
+yantrikdb-server = { workspace = true }
+yantrik-ml = { workspace = true, features = ["api-llm", "claude-cli"] }
+yantrikdb-core = { workspace = true }
+yantrik-mcp = { path = "../yantrik-mcp" }
+yantrik-chat = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+axum = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+cpal = { workspace = true }
+rubato = { workspace = true }
+ctrlc = "3"
+
+[features]
+default = ["claude-cli"]
+claude-cli = ["yantrik-ml/claude-cli"]
+llamacpp = ["yantrik-ml/llamacpp"]
+llamacpp-cuda = ["llamacpp", "yantrik-ml/llamacpp-cuda"]
+llamacpp-rocm = ["llamacpp", "yantrik-ml/llamacpp-rocm"]
+llamacpp-vulkan = ["llamacpp", "yantrik-ml/llamacpp-vulkan"]
+llamacpp-metal = ["llamacpp", "yantrik-ml/llamacpp-metal"]
+cuda = ["yantrik-ml/cuda"]
+metal = ["yantrik-ml/metal"]
+accelerate = ["yantrik-ml/accelerate"]

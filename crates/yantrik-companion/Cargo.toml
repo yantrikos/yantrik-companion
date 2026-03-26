@@ -1,0 +1,32 @@
+[package]
+name = "yantrik-companion"
+version = "0.1.0"
+edition = "2021"
+description = "Yantrik companion agent — instincts, urges, context, learning, all in-process"
+
+[dependencies]
+yantrik-companion-core = { workspace = true }
+yantrik-companion-instincts = { workspace = true }
+yantrik-companion-cortex = { workspace = true }
+yantrik-companion-tools = { workspace = true }
+yantrik-chat = { workspace = true }
+yantrikdb-core = { workspace = true }
+yantrik-ml = { workspace = true, features = ["api-llm", "claude-cli"] }
+yantrik-os = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+uuid7 = { workspace = true }
+tracing = { workspace = true }
+tungstenite = { workspace = true }
+url = { workspace = true }
+imap = { workspace = true }
+native-tls = { workspace = true }
+lettre = { workspace = true }
+html2text = { workspace = true }
+mailparse = { workspace = true }
+ureq = { workspace = true }
+regex = { workspace = true }
+crossbeam-channel = { workspace = true }

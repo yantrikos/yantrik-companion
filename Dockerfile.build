@@ -1,0 +1,19 @@
+# Builder image for yantrik companion binary (Linux x86_64)
+FROM rust:1.88-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libasound2-dev \
+    libssl-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+# Build only the companion binary (no UI features)
+RUN cargo build --release --package yantrik --no-default-features \
+    && strip target/release/yantrik
+
+FROM scratch AS export
+COPY --from=builder /build/target/release/yantrik /yantrik

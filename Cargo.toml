@@ -1,26 +1,71 @@
-[package]
-name = "yantrik-companion"
-version = "0.1.0"
-edition = "2021"
-description = "Yantrik companion agent — instincts, urges, context, learning, all in-process"
+# Minimal workspace for building the companion binary only.
+# Used by Dockerfile.build — avoids pulling in apps, services, UI crates.
+[workspace]
+resolver = "2"
+members = [
+    "crates/yantrik-companion-core",
+    "crates/yantrik-companion-instincts",
+    "crates/yantrik-companion-cortex",
+    "crates/yantrik-companion-tools",
+    "crates/yantrik-chat",
+    "crates/yantrik-companion",
+    "crates/yantrikdb-server",
+    "crates/yantrik-mcp",
+    "crates/yantrik",
+    "crates/yantrik-os",
+]
 
-[dependencies]
-yantrikdb-core = { git = "https://github.com/yantrikos/yantrikdb.git" }
-yantrik-ml = { git = "https://github.com/yantrikos/yantrik-ml.git", features = ["api-llm", "claude-cli"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+# ── Shared dependencies ──────────────────────────────────────────────
+[workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+axum = "0.8"
+ureq = { version = "2", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid7 = "1"
-tracing = "0.1"
-tungstenite = "0.24"
-url = "2"
+regex = "1"
+html2text = "0.12"
+mailparse = "0.15"
+base64 = "0.22"
 imap = "2.4"
 native-tls = "0.2"
 lettre = { version = "0.11", default-features = false, features = ["rustls-tls", "builder", "smtp-transport"] }
-html2text = "0.12"
-mailparse = "0.15"
-ureq = { version = "2", features = ["json"] }
-regex = "1"
-yantrik-os = { path = "../yantrik-os" }
+cpal = "0.15"
+rubato = "0.16"
+tungstenite = "0.24"
+url = "2"
+crossbeam-channel = "0.5"
+sysinfo = "0.33"
+libc = "0.2"
+
+# Internal crates
+yantrik-companion-core = { path = "crates/yantrik-companion-core" }
+yantrik-companion-instincts = { path = "crates/yantrik-companion-instincts" }
+yantrik-companion-cortex = { path = "crates/yantrik-companion-cortex" }
+yantrik-companion-tools = { path = "crates/yantrik-companion-tools" }
+yantrik-chat = { path = "crates/yantrik-chat" }
+yantrik-companion = { path = "crates/yantrik-companion" }
+yantrik-os = { path = "crates/yantrik-os" }
+yantrikdb-core = { git = "https://github.com/yantrikos/yantrikdb.git" }
+yantrik-ml = { git = "https://github.com/yantrikos/yantrik-ml.git" }
+yantrikdb-server = { path = "crates/yantrikdb-server" }
+
+[profile.dev.package.candle-core]
+opt-level = 2
+[profile.dev.package.candle-nn]
+opt-level = 2
+[profile.dev.package.candle-transformers]
+opt-level = 2
+[profile.dev.package.tokenizers]
+opt-level = 2
+
+[patch."https://github.com/yantrikos/yantrikdb.git"]
+yantrikdb-core = { path = "crates/yantrikdb-core" }
+
+[patch."https://github.com/yantrikos/yantrik-ml.git"]
+yantrik-ml = { path = "crates/yantrik-ml" }

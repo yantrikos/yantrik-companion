@@ -1,4 +1,7 @@
 target/
+.git/
+.github/
+.vscode/
 *.db
 .env
 .mcp.json

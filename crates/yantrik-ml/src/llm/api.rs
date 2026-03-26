@@ -1,0 +1,1108 @@
+//! API-based LLM backend — sends requests to OpenAI-compatible HTTP endpoints.
+//!
+//! Supports both OpenAI `/v1/chat/completions` and Ollama native `/api/chat`.
+//! Auto-detects Ollama by URL pattern and uses native endpoint for proper
+//! thinking mode control.
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read as _};
+
+use anyhow::{Context, Result};
+
+use crate::chat_template;
+use crate::chat_templates;
+use crate::capability::ModelFamily;
+use crate::llm::strip_think_tags;
+use crate::traits::LLMBackend;
+use crate::types::{ApiToolCall, ApiToolCallFunction, ChatMessage, GenerationConfig, LLMResponse, ToolCall};
+
+/// OpenAI-compatible API LLM backend with Ollama native support.
+pub struct ApiLLM {
+    base_url: String,
+    api_key: Option<String>,
+    model: String,
+    /// True when talking to Ollama — use native /api/chat for think control.
+    is_ollama: bool,
+    /// Model family for family-aware template selection.
+    family: ModelFamily,
+}
+
+impl ApiLLM {
+    pub fn new(base_url: impl Into<String>, api_key: Option<String>, model: impl Into<String>) -> Self {
+        let base_url: String = base_url.into();
+        let model: String = model.into();
+        let is_ollama = base_url.contains(":11434");
+        let family = ModelFamily::from_model_name(&model);
+        Self {
+            base_url,
+            api_key,
+            is_ollama,
+            family,
+            model,
+        }
+    }
+
+    /// Get the model name/identifier for capability profiling.
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    /// Get the family-aware chat template for this model.
+    fn template(&self) -> Box<dyn chat_templates::ChatTemplate> {
+        chat_templates::template_for_family(self.family)
+    }
+
+    /// Serialize a ChatMessage to JSON, including tool_calls/tool_call_id/name when present.
+    fn serialize_message(m: &ChatMessage, ollama_compat: bool) -> serde_json::Value {
+        let mut msg = serde_json::json!({ "role": m.role });
+
+        // Content can be null for assistant messages that only have tool_calls
+        if m.role == "assistant" && m.content.is_empty() && m.tool_calls.is_some() {
+            msg["content"] = serde_json::Value::Null;
+        } else {
+            msg["content"] = serde_json::json!(m.content);
+        }
+
+        if let Some(ref calls) = m.tool_calls {
+            if ollama_compat {
+                // Ollama expects arguments as JSON objects, not strings
+                let fixed: Vec<serde_json::Value> = calls.iter().map(|tc| {
+                    let args = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                        .unwrap_or(serde_json::json!({}));
+                    serde_json::json!({
+                        "id": tc.id,
+                        "function": { "name": tc.function.name, "arguments": args }
+                    })
+                }).collect();
+                msg["tool_calls"] = serde_json::json!(fixed);
+            } else {
+                msg["tool_calls"] = serde_json::json!(calls);
+            }
+        }
+        if let Some(ref id) = m.tool_call_id {
+            msg["tool_call_id"] = serde_json::json!(id);
+        }
+        if let Some(ref name) = m.name {
+            msg["name"] = serde_json::json!(name);
+        }
+
+        msg
+    }
+
+    // ── Ollama native API (/api/chat) ──
+
+    /// Build request body for Ollama native /api/chat endpoint.
+    fn build_ollama_body(
+        &self,
+        messages: &[ChatMessage],
+        config: &GenerationConfig,
+        tools: Option<&[serde_json::Value]>,
+        stream: bool,
+    ) -> serde_json::Value {
+        let msgs: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| Self::serialize_message(m, true))
+            .collect();
+
+        let mut options = serde_json::json!({
+            "temperature": config.temperature,
+            "num_predict": config.max_tokens,
+            "num_ctx": config.max_context.unwrap_or(4096),
+        });
+
+        if let Some(p) = config.top_p {
+            options["top_p"] = serde_json::json!(p);
+        }
+        if config.repeat_penalty != 1.0 {
+            options["repeat_penalty"] = serde_json::json!(config.repeat_penalty);
+        }
+        if !config.stop.is_empty() {
+            options["stop"] = serde_json::json!(config.stop);
+        }
+
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": msgs,
+            "stream": stream,
+            "keep_alive": -1,
+            "options": options,
+        });
+
+        // Disable thinking mode for families that need it (Qwen, Nemotron, etc.)
+        if self.template().disable_thinking() {
+            body["think"] = serde_json::json!(false);
+        }
+
+        if let Some(tools) = tools {
+            if !tools.is_empty() {
+                body["tools"] = serde_json::json!(tools);
+            }
+        }
+
+        body
+    }
+
+    /// Get Ollama base URL (strip /v1 suffix if present).
+    fn ollama_base_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        base.trim_end_matches("/v1").to_string()
+    }
+
+    fn send_ollama_request(&self, body: &serde_json::Value) -> Result<ureq::Body> {
+        let url = format!("{}/api/chat", self.ollama_base_url());
+        let body_str = serde_json::to_string(body)?;
+
+        let tool_count = body.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
+        tracing::debug!(body_bytes = body_str.len(), tools = tool_count, url = %url, "Ollama request");
+
+        let agent = ureq::Agent::new_with_config(
+            ureq::config::Config::builder()
+                .timeout_global(Some(std::time::Duration::from_secs(300)))
+                .build()
+        );
+
+        let agent_no_err = ureq::Agent::new_with_config(
+            ureq::config::Config::builder()
+                .timeout_global(Some(std::time::Duration::from_secs(300)))
+                .http_status_as_error(false)
+                .build()
+        );
+
+        let resp = agent_no_err.post(&url)
+            .header("Content-Type", "application/json")
+            .send(body_str.as_bytes())
+            .map_err(|e| {
+                tracing::error!(error = %e, body_bytes = body_str.len(), tools = tool_count, "Ollama API request failed");
+                e
+            })
+            .context("Ollama API request failed")?;
+
+        let status = resp.status();
+        if status != 200 {
+            let err_body = resp.into_body().read_to_string().unwrap_or_default();
+            let preview = &err_body[..err_body.len().min(1000)];
+            tracing::error!(
+                status = status.as_u16(),
+                body_bytes = body_str.len(),
+                tools = tool_count,
+                error_response = %preview,
+                "Ollama API returned error"
+            );
+            anyhow::bail!("Ollama API request failed: http status: {}", status.as_u16());
+        }
+
+        Ok(resp.into_body())
+    }
+
+    /// Non-streaming Ollama chat.
+    fn ollama_chat(
+        &self,
+        messages: &[ChatMessage],
+        config: &GenerationConfig,
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<LLMResponse> {
+        // Text-injection: for non-Ollama backends OR when Ollama's native template
+        // can't handle the tool count (e.g. Nemotron with >12 tools).
+        let tool_count = tools.map(|t| t.len()).unwrap_or(0);
+        let force_text = self.use_text_injection_tools()
+            || self.needs_text_injection_for_tool_count(tool_count);
+        let patched_messages;
+        let (final_messages, final_tools) = if force_text {
+            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+                if self.needs_text_injection_for_tool_count(tool_count) {
+                    tracing::info!(
+                        tool_count, max = Self::MAX_OLLAMA_NEMOTRON_NATIVE_TOOLS,
+                        "Nemotron: too many tools for native, falling back to text-injection"
+                    );
+                }
+                patched_messages = self.inject_tools_into_messages(messages, tools);
+                (patched_messages.as_slice(), None)
+            } else {
+                (messages, None)
+            }
+        } else {
+            (messages, tools)
+        };
+        let body = self.build_ollama_body(final_messages, config, final_tools, false);
+        let mut resp_body = self.send_ollama_request(&body)?;
+
+        let json: serde_json::Value = resp_body.read_json()?;
+
+        let message = &json["message"];
+        let raw_text = message["content"].as_str().unwrap_or("").to_string();
+        let text = strip_think_tags(&raw_text);
+
+        let eval_count = json["eval_count"].as_u64().unwrap_or(0) as usize;
+        let prompt_eval_count = json["prompt_eval_count"].as_u64().unwrap_or(0) as usize;
+
+        // Parse tool calls (Ollama uses same format as OpenAI)
+        let api_tool_calls = Self::parse_api_tool_calls(message);
+        let tool_calls = if !api_tool_calls.is_empty() {
+            api_tool_calls.iter().filter_map(ToolCall::from_api).collect()
+        } else {
+            self.template().parse_tool_calls(&text)
+        };
+
+        Ok(LLMResponse {
+            text,
+            prompt_tokens: prompt_eval_count,
+            completion_tokens: eval_count,
+            tool_calls,
+            api_tool_calls,
+            stop_reason: if json["done"].as_bool() == Some(true) { "stop".to_string() } else { "length".to_string() },
+        })
+    }
+
+    /// Streaming Ollama chat (newline-delimited JSON, not SSE).
+    fn ollama_chat_streaming(
+        &self,
+        messages: &[ChatMessage],
+        config: &GenerationConfig,
+        tools: Option<&[serde_json::Value]>,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<LLMResponse> {
+        // Text-injection: for non-Ollama backends OR when Ollama's native template
+        // can't handle the tool count (e.g. Nemotron with >12 tools).
+        let tool_count = tools.map(|t| t.len()).unwrap_or(0);
+        let force_text = self.use_text_injection_tools()
+            || self.needs_text_injection_for_tool_count(tool_count);
+        let patched_messages;
+        let (final_messages, final_tools) = if force_text {
+            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+                if self.needs_text_injection_for_tool_count(tool_count) {
+                    tracing::info!(
+                        tool_count, max = Self::MAX_OLLAMA_NEMOTRON_NATIVE_TOOLS,
+                        "Nemotron: too many tools for native, falling back to text-injection"
+                    );
+                }
+                patched_messages = self.inject_tools_into_messages(messages, tools);
+                (patched_messages.as_slice(), None)
+            } else {
+                (messages, None)
+            }
+        } else {
+            (messages, tools)
+        };
+        let body = self.build_ollama_body(final_messages, config, final_tools, true);
+        let resp_body = self.send_ollama_request(&body)?;
+
+        let reader = BufReader::new(resp_body.into_reader());
+
+        let mut full_text = String::new();
+        let mut stop_reason = "stop".to_string();
+        let mut eval_count = 0usize;
+        let mut api_tool_calls = Vec::new();
+        let mut in_think = false;
+        let mut think_buf = String::new();
+
+        for line_result in reader.lines() {
+            let line: String = line_result.context("reading Ollama stream line")?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let chunk: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Extract content token with think-tag filtering
+            if let Some(content) = chunk["message"]["content"].as_str() {
+                if !content.is_empty() {
+                    if in_think {
+                        think_buf.push_str(content);
+                        if think_buf.contains("</think>") {
+                            // Thinking block complete — discard it, emit any text after </think>
+                            if let Some(after) = think_buf.split("</think>").last() {
+                                let after = after.trim_start();
+                                if !after.is_empty() {
+                                    on_token(after);
+                                    full_text.push_str(after);
+                                }
+                            }
+                            in_think = false;
+                            think_buf.clear();
+                        }
+                    } else if content.contains("<think>") {
+                        // Start of think block — buffer any partial content after <think>
+                        if let Some(before) = content.split("<think>").next() {
+                            if !before.is_empty() {
+                                on_token(before);
+                                full_text.push_str(before);
+                            }
+                        }
+                        let after_tag = content.splitn(2, "<think>").nth(1).unwrap_or("");
+                        think_buf.push_str(after_tag);
+                        if think_buf.contains("</think>") {
+                            if let Some(after) = think_buf.split("</think>").last() {
+                                let after = after.trim_start();
+                                if !after.is_empty() {
+                                    on_token(after);
+                                    full_text.push_str(after);
+                                }
+                            }
+                            think_buf.clear();
+                        } else {
+                            in_think = true;
+                        }
+                    } else {
+                        on_token(content);
+                        full_text.push_str(content);
+                    }
+                }
+            }
+
+            // Tool calls — Ollama sends them in a done:false chunk, not the final one
+            let tc = Self::parse_api_tool_calls(&chunk["message"]);
+            if !tc.is_empty() {
+                api_tool_calls = tc;
+            }
+
+            if chunk["done"].as_bool() == Some(true) {
+                eval_count = chunk["eval_count"].as_u64().unwrap_or(0) as usize;
+                if chunk["done_reason"].as_str() == Some("length") {
+                    stop_reason = "length".to_string();
+                }
+            }
+        }
+
+        // Final safety: strip any remaining think tags from assembled text
+        let full_text = strip_think_tags(&full_text);
+
+        let tool_calls = if !api_tool_calls.is_empty() {
+            api_tool_calls.iter().filter_map(ToolCall::from_api).collect()
+        } else {
+            self.template().parse_tool_calls(&full_text)
+        };
+
+        Ok(LLMResponse {
+            text: full_text,
+            prompt_tokens: 0,
+            completion_tokens: eval_count,
+            tool_calls,
+            api_tool_calls,
+            stop_reason,
+        })
+    }
+
+    // ── OpenAI-compatible API (/v1/chat/completions) ──
+
+    /// Whether this backend should use text-injection for tools (vs native API tools).
+    ///
+    /// Text-injection injects tool definitions into the system prompt and parses
+    /// tool calls from the model's text output using family-specific templates.
+    ///
+    /// Used when:
+    /// - Nemotron models (always): Ollama's native tool template for nemotron produces
+    ///   XML parsing errors with many tools. Our text-injection parser is more robust.
+    /// - Non-Ollama local models (llama-server, etc.): typically lack proper jinja
+    ///   templates for native tool calling.
+    /// - NOT used for cloud APIs (OpenAI, Anthropic) which handle tools natively.
+    /// Maximum tools Ollama's nemotron template can handle natively.
+    /// Ollama's Go XML renderer still fails with >25 tools (XML syntax errors).
+    /// When exceeded, falls back to text-injection in the system prompt.
+    const MAX_OLLAMA_NEMOTRON_NATIVE_TOOLS: usize = 25;
+
+    fn use_text_injection_tools(&self) -> bool {
+        // Cloud APIs handle tools natively
+        if matches!(self.family, ModelFamily::OpenAI | ModelFamily::Anthropic) {
+            return false;
+        }
+        // Other local models on non-Ollama servers need text-injection
+        !self.is_ollama
+    }
+
+    /// Whether to fall back to text-injection for this specific call due to
+    /// Ollama template limitations with many tools.
+    fn needs_text_injection_for_tool_count(&self, tool_count: usize) -> bool {
+        self.is_ollama
+            && matches!(self.family, ModelFamily::Nemotron)
+            && tool_count > Self::MAX_OLLAMA_NEMOTRON_NATIVE_TOOLS
+    }
+
+    /// Inject tool definitions into the system message using the family-specific template.
+    fn inject_tools_into_messages(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> Vec<ChatMessage> {
+        let template = self.template();
+        let tool_block = template.format_tools(tools);
+        if tool_block.is_empty() {
+            return messages.to_vec();
+        }
+
+        let mut patched = messages.to_vec();
+        if !patched.is_empty() && patched[0].role == "system" {
+            patched[0] = ChatMessage::system(
+                format!("{}{}", patched[0].content, tool_block),
+            );
+        } else {
+            patched.insert(0, ChatMessage::system(tool_block));
+        }
+        patched
+    }
+
+    fn build_openai_body(
+        &self,
+        messages: &[ChatMessage],
+        config: &GenerationConfig,
+        tools: Option<&[serde_json::Value]>,
+        stream: bool,
+    ) -> serde_json::Value {
+        // Anthropic Messages API has a different body format
+        if self.is_anthropic() {
+            return self.build_anthropic_body(messages, config, tools, stream);
+        }
+
+        // For local models on non-Ollama servers (e.g. llama-server), inject tools
+        // into the system prompt instead of passing them via the API tools field.
+        let use_text_injection = self.use_text_injection_tools();
+        let patched_messages;
+        let (final_messages, final_tools) = if use_text_injection {
+            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+                patched_messages = self.inject_tools_into_messages(messages, tools);
+                tracing::debug!(
+                    tool_count = tools.len(),
+                    "Text-injecting tools into system prompt for non-Ollama endpoint"
+                );
+                (patched_messages.as_slice(), None)
+            } else {
+                (messages, None)
+            }
+        } else {
+            (messages, tools)
+        };
+
+        let msgs: Vec<serde_json::Value> = final_messages
+            .iter()
+            .map(|m| Self::serialize_message(m, false))
+            .collect();
+
+        // GPT-5+ models require max_completion_tokens instead of max_tokens
+        let max_tokens_key = if self.model.starts_with("gpt-5") || self.model.starts_with("o3") || self.model.starts_with("o4") {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": msgs,
+            max_tokens_key: config.max_tokens,
+            "temperature": config.temperature,
+            "stream": stream,
+        });
+
+        if let Some(p) = config.top_p {
+            body["top_p"] = serde_json::json!(p);
+        }
+
+        if !config.stop.is_empty() {
+            body["stop"] = serde_json::json!(config.stop);
+        }
+
+        if config.repeat_penalty != 1.0 {
+            body["frequency_penalty"] = serde_json::json!((config.repeat_penalty - 1.0).clamp(-2.0, 2.0));
+        }
+
+        // Disable thinking mode for families that need it (Qwen, Nemotron, etc.)
+        if self.template().disable_thinking() {
+            body["think"] = serde_json::json!(false);
+        }
+
+        if let Some(tools) = final_tools {
+            if !tools.is_empty() {
+                body["tools"] = serde_json::json!(tools);
+            }
+        }
+
+        body
+    }
+
+    // ── Anthropic Messages API adapter ──
+
+    /// Build request body for Anthropic's Messages API format.
+    /// Anthropic uses a different structure: system is top-level, no "system" role in messages,
+    /// and tools use input_schema instead of parameters.
+    fn build_anthropic_body(
+        &self,
+        messages: &[ChatMessage],
+        config: &GenerationConfig,
+        tools: Option<&[serde_json::Value]>,
+        stream: bool,
+    ) -> serde_json::Value {
+        // Extract system message (Anthropic puts it top-level, not in messages array)
+        let mut system_text = String::new();
+        let mut anthropic_msgs: Vec<serde_json::Value> = Vec::new();
+
+        for m in messages {
+            if m.role == "system" {
+                if !system_text.is_empty() {
+                    system_text.push('\n');
+                }
+                system_text.push_str(&m.content);
+                continue;
+            }
+
+            // Convert tool role to Anthropic's tool_result content block
+            if m.role == "tool" {
+                anthropic_msgs.push(serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": m.tool_call_id.as_deref().unwrap_or(""),
+                        "content": m.content,
+                    }]
+                }));
+                continue;
+            }
+
+            // Convert assistant tool_calls to Anthropic's tool_use content blocks
+            if m.role == "assistant" {
+                if let Some(ref calls) = m.tool_calls {
+                    let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+                    if !m.content.is_empty() {
+                        content_blocks.push(serde_json::json!({
+                            "type": "text",
+                            "text": m.content,
+                        }));
+                    }
+                    for tc in calls {
+                        let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                            .unwrap_or(serde_json::json!({}));
+                        content_blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.function.name,
+                            "input": input,
+                        }));
+                    }
+                    anthropic_msgs.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": content_blocks,
+                    }));
+                    continue;
+                }
+            }
+
+            anthropic_msgs.push(serde_json::json!({
+                "role": m.role,
+                "content": m.content,
+            }));
+        }
+
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": anthropic_msgs,
+            "max_tokens": config.max_tokens,
+            "temperature": config.temperature,
+            "stream": stream,
+        });
+
+        if !system_text.is_empty() {
+            body["system"] = serde_json::json!(system_text);
+        }
+
+        if let Some(p) = config.top_p {
+            body["top_p"] = serde_json::json!(p);
+        }
+
+        if !config.stop.is_empty() {
+            body["stop_sequences"] = serde_json::json!(config.stop);
+        }
+
+        // Convert OpenAI-format tools to Anthropic format (input_schema instead of parameters)
+        if let Some(tools) = tools {
+            if !tools.is_empty() {
+                let anthropic_tools: Vec<serde_json::Value> = tools.iter().filter_map(|t| {
+                    let func = t.get("function")?;
+                    Some(serde_json::json!({
+                        "name": func["name"],
+                        "description": func.get("description").cloned().unwrap_or(serde_json::json!("")),
+                        "input_schema": func.get("parameters").cloned().unwrap_or(serde_json::json!({"type": "object", "properties": {}})),
+                    }))
+                }).collect();
+                body["tools"] = serde_json::json!(anthropic_tools);
+            }
+        }
+
+        body
+    }
+
+    /// Parse Anthropic Messages API response into LLMResponse.
+    fn parse_anthropic_response(&self, json: &serde_json::Value) -> LLMResponse {
+        let mut text = String::new();
+        let mut api_tool_calls = Vec::new();
+
+        if let Some(content) = json["content"].as_array() {
+            for block in content {
+                match block["type"].as_str() {
+                    Some("text") => {
+                        text.push_str(block["text"].as_str().unwrap_or(""));
+                    }
+                    Some("tool_use") => {
+                        let id = block["id"].as_str().unwrap_or("").to_string();
+                        let name = block["name"].as_str().unwrap_or("").to_string();
+                        let arguments = serde_json::to_string(&block["input"])
+                            .unwrap_or_else(|_| "{}".to_string());
+                        api_tool_calls.push(ApiToolCall {
+                            id,
+                            call_type: "function".to_string(),
+                            function: ApiToolCallFunction { name, arguments },
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let text = strip_think_tags(&text);
+
+        let prompt_tokens = json["usage"]["input_tokens"].as_u64().unwrap_or(0) as usize;
+        let completion_tokens = json["usage"]["output_tokens"].as_u64().unwrap_or(0) as usize;
+
+        let stop_reason = match json["stop_reason"].as_str() {
+            Some("end_turn") => "stop".to_string(),
+            Some("max_tokens") => "length".to_string(),
+            Some("tool_use") => "tool_calls".to_string(),
+            Some(r) => r.to_string(),
+            None => "stop".to_string(),
+        };
+
+        let tool_calls = api_tool_calls.iter().filter_map(ToolCall::from_api).collect();
+
+        LLMResponse {
+            text,
+            prompt_tokens,
+            completion_tokens,
+            tool_calls,
+            api_tool_calls,
+            stop_reason,
+        }
+    }
+
+    /// Parse Anthropic SSE streaming response.
+    /// Anthropic events: content_block_start, content_block_delta, content_block_stop,
+    /// message_delta (has stop_reason + usage), message_stop.
+    fn parse_anthropic_stream(
+        &self,
+        resp_body: ureq::Body,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<LLMResponse> {
+        let reader = BufReader::new(resp_body.into_reader());
+
+        let mut full_text = String::new();
+        let mut stop_reason = "stop".to_string();
+        let mut api_tool_calls: Vec<ApiToolCall> = Vec::new();
+        let mut prompt_tokens = 0usize;
+        let mut completion_tokens = 0usize;
+
+        // Track current tool_use block being streamed
+        let mut current_tool_id = String::new();
+        let mut current_tool_name = String::new();
+        let mut current_tool_args = String::new();
+        let mut in_tool_use = false;
+
+        for line_result in reader.lines() {
+            let line: String = line_result.context("reading Anthropic SSE line")?;
+
+            let data = if let Some(stripped) = line.strip_prefix("data: ") {
+                stripped
+            } else {
+                continue;
+            };
+
+            let chunk: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            match chunk["type"].as_str() {
+                Some("message_start") => {
+                    if let Some(usage) = chunk["message"]["usage"].as_object() {
+                        prompt_tokens = usage.get("input_tokens")
+                            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    }
+                }
+                Some("content_block_start") => {
+                    let block = &chunk["content_block"];
+                    if block["type"].as_str() == Some("tool_use") {
+                        in_tool_use = true;
+                        current_tool_id = block["id"].as_str().unwrap_or("").to_string();
+                        current_tool_name = block["name"].as_str().unwrap_or("").to_string();
+                        current_tool_args.clear();
+                    }
+                }
+                Some("content_block_delta") => {
+                    let delta = &chunk["delta"];
+                    match delta["type"].as_str() {
+                        Some("text_delta") => {
+                            if let Some(text) = delta["text"].as_str() {
+                                on_token(text);
+                                full_text.push_str(text);
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(json_str) = delta["partial_json"].as_str() {
+                                current_tool_args.push_str(json_str);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some("content_block_stop") => {
+                    if in_tool_use {
+                        api_tool_calls.push(ApiToolCall {
+                            id: std::mem::take(&mut current_tool_id),
+                            call_type: "function".to_string(),
+                            function: ApiToolCallFunction {
+                                name: std::mem::take(&mut current_tool_name),
+                                arguments: std::mem::take(&mut current_tool_args),
+                            },
+                        });
+                        in_tool_use = false;
+                    }
+                }
+                Some("message_delta") => {
+                    if let Some(reason) = chunk["delta"]["stop_reason"].as_str() {
+                        stop_reason = match reason {
+                            "end_turn" => "stop".to_string(),
+                            "max_tokens" => "length".to_string(),
+                            "tool_use" => "tool_calls".to_string(),
+                            r => r.to_string(),
+                        };
+                    }
+                    if let Some(usage) = chunk["usage"].as_object() {
+                        completion_tokens = usage.get("output_tokens")
+                            .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    }
+                }
+                Some("message_stop") => break,
+                _ => {}
+            }
+        }
+
+        let full_text = strip_think_tags(&full_text);
+        let tool_calls = api_tool_calls.iter().filter_map(ToolCall::from_api).collect();
+
+        Ok(LLMResponse {
+            text: full_text,
+            prompt_tokens,
+            completion_tokens,
+            tool_calls,
+            api_tool_calls,
+            stop_reason,
+        })
+    }
+
+    fn openai_endpoint_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.contains("anthropic.com") {
+            // Anthropic Messages API uses /v1/messages, not /v1/chat/completions
+            format!("{}/messages", base)
+        } else {
+            format!("{}/chat/completions", base)
+        }
+    }
+
+    /// Whether this backend is targeting Anthropic's Messages API.
+    fn is_anthropic(&self) -> bool {
+        self.base_url.contains("anthropic.com")
+    }
+
+    fn send_openai_request(&self, body: &serde_json::Value) -> Result<ureq::Body> {
+        let url = self.openai_endpoint_url();
+        let body_str = serde_json::to_string(body)?;
+
+        let agent = ureq::Agent::new_with_config(
+            ureq::config::Config::builder()
+                .timeout_global(Some(std::time::Duration::from_secs(300)))
+                .http_status_as_error(false)
+                .build()
+        );
+
+        let mut req = agent.post(&url)
+            .header("Content-Type", "application/json");
+
+        if let Some(ref key) = self.api_key {
+            if self.base_url.contains("anthropic.com") {
+                // Anthropic uses x-api-key header and requires anthropic-version
+                req = req.header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01");
+            } else {
+                req = req.header("Authorization", &format!("Bearer {key}"));
+            }
+        }
+
+        let resp = req
+            .send(body_str.as_bytes())
+            .context("API request failed")?;
+
+        let status = resp.status();
+        if status != 200 {
+            let err_body = resp.into_body().read_to_string().unwrap_or_default();
+            let preview = &err_body[..err_body.len().min(1000)];
+            tracing::error!(
+                status = status.as_u16(),
+                body_bytes = body_str.len(),
+                error_response = %preview,
+                "OpenAI-compatible API returned error"
+            );
+            anyhow::bail!("API request failed: http status: {}", status.as_u16());
+        }
+
+        Ok(resp.into_body())
+    }
+
+    /// Parse native tool_calls from the response JSON.
+    fn parse_api_tool_calls(message: &serde_json::Value) -> Vec<ApiToolCall> {
+        let Some(calls) = message["tool_calls"].as_array() else {
+            return Vec::new();
+        };
+
+        calls
+            .iter()
+            .filter_map(|tc| {
+                let id = tc["id"].as_str()?.to_string();
+                let call_type = tc["type"].as_str().unwrap_or("function").to_string();
+                let name = tc["function"]["name"].as_str()?.to_string();
+                // Ollama native returns arguments as JSON object; OpenAI returns as string
+                let arguments = match &tc["function"]["arguments"] {
+                    v if v.is_string() => v.as_str().unwrap().to_string(),
+                    v if v.is_object() || v.is_array() => serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()),
+                    _ => "{}".to_string(),
+                };
+                Some(ApiToolCall {
+                    id,
+                    call_type,
+                    function: ApiToolCallFunction { name, arguments },
+                })
+            })
+            .collect()
+    }
+}
+
+impl LLMBackend for ApiLLM {
+    fn chat(
+        &self,
+        messages: &[ChatMessage],
+        config: &GenerationConfig,
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<LLMResponse> {
+        // Use Ollama native API for proper think control
+        if self.is_ollama {
+            return self.ollama_chat(messages, config, tools);
+        }
+
+        let body = self.build_openai_body(messages, config, tools, false);
+        let mut resp_body = self.send_openai_request(&body)?;
+
+        let json: serde_json::Value = resp_body.read_json()?;
+
+        // Anthropic Messages API has a different response format
+        if self.is_anthropic() {
+            return Ok(self.parse_anthropic_response(&json));
+        }
+
+        let message = &json["choices"][0]["message"];
+
+        let text = strip_think_tags(
+            message["content"].as_str().unwrap_or("")
+        );
+
+        let prompt_tokens = json["usage"]["prompt_tokens"]
+            .as_u64()
+            .unwrap_or(0) as usize;
+        let completion_tokens = json["usage"]["completion_tokens"]
+            .as_u64()
+            .unwrap_or(0) as usize;
+
+        let stop_reason = json["choices"][0]["finish_reason"]
+            .as_str()
+            .unwrap_or("stop")
+            .to_string();
+
+        let api_tool_calls = Self::parse_api_tool_calls(message);
+
+        let tool_calls = if !api_tool_calls.is_empty() {
+            api_tool_calls
+                .iter()
+                .filter_map(ToolCall::from_api)
+                .collect()
+        } else {
+            self.template().parse_tool_calls(&text)
+        };
+
+        Ok(LLMResponse {
+            text,
+            prompt_tokens,
+            completion_tokens,
+            tool_calls,
+            api_tool_calls,
+            stop_reason,
+        })
+    }
+
+    fn chat_streaming(
+        &self,
+        messages: &[ChatMessage],
+        config: &GenerationConfig,
+        tools: Option<&[serde_json::Value]>,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<LLMResponse> {
+        // Use Ollama native streaming for proper think control
+        if self.is_ollama {
+            return self.ollama_chat_streaming(messages, config, tools, on_token);
+        }
+
+        let body = self.build_openai_body(messages, config, tools, true);
+        let resp_body = self.send_openai_request(&body)?;
+
+        // Anthropic streaming uses different SSE event format
+        if self.is_anthropic() {
+            return self.parse_anthropic_stream(resp_body, on_token);
+        }
+
+        let reader = BufReader::new(resp_body.into_reader());
+
+        let mut full_text = String::new();
+        let mut stop_reason = "stop".to_string();
+        let mut in_think = false;
+        let mut think_buf = String::new();
+
+        let mut tc_ids: HashMap<usize, String> = HashMap::new();
+        let mut tc_names: HashMap<usize, String> = HashMap::new();
+        let mut tc_args: HashMap<usize, String> = HashMap::new();
+
+        for line_result in reader.lines() {
+            let line: String = line_result.context("reading SSE line")?;
+
+            let data = if let Some(stripped) = line.strip_prefix("data: ") {
+                stripped
+            } else {
+                continue;
+            };
+
+            if data == "[DONE]" {
+                break;
+            }
+
+            let chunk: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let delta = &chunk["choices"][0]["delta"];
+
+            if let Some(content) = delta["content"].as_str() {
+                if in_think {
+                    think_buf.push_str(content);
+                    if think_buf.contains("</think>") {
+                        if let Some(after) = think_buf.split("</think>").last() {
+                            let after = after.trim_start();
+                            if !after.is_empty() {
+                                on_token(after);
+                                full_text.push_str(after);
+                            }
+                        }
+                        in_think = false;
+                        think_buf.clear();
+                    }
+                } else if content.contains("<think>") {
+                    if let Some(before) = content.split("<think>").next() {
+                        if !before.is_empty() {
+                            on_token(before);
+                            full_text.push_str(before);
+                        }
+                    }
+                    let after_tag = content.splitn(2, "<think>").nth(1).unwrap_or("");
+                    think_buf.push_str(after_tag);
+                    if think_buf.contains("</think>") {
+                        if let Some(after) = think_buf.split("</think>").last() {
+                            let after = after.trim_start();
+                            if !after.is_empty() {
+                                on_token(after);
+                                full_text.push_str(after);
+                            }
+                        }
+                        think_buf.clear();
+                    } else {
+                        in_think = true;
+                    }
+                } else {
+                    on_token(content);
+                    full_text.push_str(content);
+                }
+            }
+
+            if let Some(tool_calls) = delta["tool_calls"].as_array() {
+                for tc_delta in tool_calls {
+                    let idx = tc_delta["index"].as_u64().unwrap_or(0) as usize;
+                    if let Some(id) = tc_delta["id"].as_str() {
+                        tc_ids.insert(idx, id.to_string());
+                    }
+                    if let Some(name) = tc_delta["function"]["name"].as_str() {
+                        tc_names.entry(idx).or_default().push_str(name);
+                    }
+                    if let Some(args) = tc_delta["function"]["arguments"].as_str() {
+                        tc_args.entry(idx).or_default().push_str(args);
+                    }
+                }
+            }
+
+            if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
+                stop_reason = reason.to_string();
+            }
+        }
+
+        let mut api_tool_calls = Vec::new();
+        let max_idx = tc_names.keys().copied().max().unwrap_or(0);
+        for idx in 0..=max_idx {
+            if let Some(name) = tc_names.get(&idx) {
+                let id = tc_ids.get(&idx).cloned().unwrap_or_else(|| format!("call_{idx}"));
+                let arguments = tc_args.get(&idx).cloned().unwrap_or_else(|| "{}".to_string());
+                api_tool_calls.push(ApiToolCall {
+                    id,
+                    call_type: "function".to_string(),
+                    function: ApiToolCallFunction {
+                        name: name.clone(),
+                        arguments,
+                    },
+                });
+            }
+        }
+
+        let full_text = strip_think_tags(&full_text);
+
+        let tool_calls = if !api_tool_calls.is_empty() {
+            api_tool_calls
+                .iter()
+                .filter_map(ToolCall::from_api)
+                .collect()
+        } else {
+            self.template().parse_tool_calls(&full_text)
+        };
+
+        Ok(LLMResponse {
+            text: full_text,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls,
+            api_tool_calls,
+            stop_reason,
+        })
+    }
+
+    fn count_tokens(&self, text: &str) -> Result<usize> {
+        Ok(text.len() / 4)
+    }
+
+    fn backend_name(&self) -> &str {
+        "api"
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+}
