@@ -31,7 +31,13 @@ impl ApiLLM {
     pub fn new(base_url: impl Into<String>, api_key: Option<String>, model: impl Into<String>) -> Self {
         let base_url: String = base_url.into();
         let model: String = model.into();
-        let is_ollama = base_url.contains(":11434");
+        // Detect both self-hosted Ollama (port 11434) and Ollama Cloud
+        // (cloud.ollama.com / ollama.com). In both cases we want the
+        // native /api/chat endpoint so `think: false` takes effect and
+        // we don't burn all max_tokens on thinking preamble.
+        let is_ollama = base_url.contains(":11434")
+            || base_url.contains("ollama.com")
+            || base_url.contains("cloud.ollama.com");
         let family = ModelFamily::from_model_name(&model);
         Self {
             base_url,
@@ -168,9 +174,15 @@ impl ApiLLM {
                 .build()
         );
 
-        let resp = agent_no_err.post(&url)
-            .header("Content-Type", "application/json")
-            .send(body_str.as_bytes())
+        let mut req = agent_no_err.post(&url)
+            .header("Content-Type", "application/json");
+        // Ollama Cloud requires Authorization: Bearer <key>. Self-hosted
+        // Ollama at :11434 ignores the header when absent — safe to
+        // send it unconditionally when an api_key is set.
+        if let Some(ref key) = self.api_key {
+            req = req.header("Authorization", &format!("Bearer {}", key));
+        }
+        let resp = req.send(body_str.as_bytes())
             .map_err(|e| {
                 tracing::error!(error = %e, body_bytes = body_str.len(), tools = tool_count, "Ollama API request failed");
                 e
