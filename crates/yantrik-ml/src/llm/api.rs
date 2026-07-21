@@ -521,6 +521,13 @@ impl ApiLLM {
         // Disable thinking mode for families that need it (Qwen, Nemotron, etc.)
         if self.template().disable_thinking() {
             body["think"] = serde_json::json!(false);
+            // Ollama's OpenAI-compat endpoint (/v1/chat/completions) IGNORES `think` — the
+            // thinking preamble still generates and lands in a `reasoning` field, so a grounded
+            // turn spends ~10s reasoning and multi-step agent loops stack up into gateway
+            // timeouts. `reasoning_effort:"none"` is what actually suppresses it there (verified
+            // on qwen3.6 via the TLS gateway: 10s→0.9s, clean `content`). Scoped to
+            // disable_thinking() families (Qwen/Nemotron), so cloud reasoning models are untouched.
+            body["reasoning_effort"] = serde_json::json!("none");
         }
 
         if let Some(tools) = final_tools {
