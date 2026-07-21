@@ -271,8 +271,13 @@ impl GenericOpenAIBackend {
             "options": options,
         });
 
-        if self.presets.disable_thinking {
-            body["think"] = serde_json::json!(false);
+        // Per-call think override (config.think) wins over the provider preset — Ollama honors
+        // `think` in the request body, which is what enables dual-mode from a single model tag:
+        // OFF for tool-selection dispatch, ON for reasoning/compose. None => preset default.
+        match config.think {
+            Some(t) => body["think"] = serde_json::json!(t),
+            None if self.presets.disable_thinking => body["think"] = serde_json::json!(false),
+            None => {}
         }
 
         if let Some(tools) = tools {
@@ -432,8 +437,13 @@ impl GenericOpenAIBackend {
             body["frequency_penalty"] = serde_json::json!((config.repeat_penalty - 1.0).clamp(-2.0, 2.0));
         }
 
-        if self.presets.disable_thinking {
-            body["think"] = serde_json::json!(false);
+        // Per-call think override wins over the preset (see build_ollama_body). On the OpenAI-compat
+        // path Ollama ignores `think`, so also emit reasoning_effort:"none" when forcing OFF.
+        match config.think {
+            Some(true) => { body["think"] = serde_json::json!(true); }
+            Some(false) => { body["think"] = serde_json::json!(false); body["reasoning_effort"] = serde_json::json!("none"); }
+            None if self.presets.disable_thinking => { body["think"] = serde_json::json!(false); body["reasoning_effort"] = serde_json::json!("none"); }
+            None => {}
         }
 
         if let Some(tools) = tools {

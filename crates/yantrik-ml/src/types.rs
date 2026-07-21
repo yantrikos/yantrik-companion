@@ -141,6 +141,12 @@ pub struct GenerationConfig {
     /// Maximum context window size (num_ctx for Ollama). None = use model default.
     #[serde(default)]
     pub max_context: Option<usize>,
+    /// Per-call thinking override. `Some(true)` forces reasoning ON, `Some(false)` OFF; an explicit
+    /// value wins over the backend/provider default (Ollama honors `think` in the request body).
+    /// `None` = defer to the provider preset. Lets one model serve dual-mode: OFF for tool-selection
+    /// dispatch (fast, no quality loss), ON for reasoning/planning/compose (quality).
+    #[serde(default)]
+    pub think: Option<bool>,
 }
 
 impl Default for GenerationConfig {
@@ -155,6 +161,7 @@ impl Default for GenerationConfig {
             seed: 42,
             stop: vec![],
             max_context: None,
+            think: None,
         }
     }
 }
