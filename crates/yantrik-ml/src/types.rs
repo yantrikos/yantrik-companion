@@ -147,6 +147,11 @@ pub struct GenerationConfig {
     /// dispatch (fast, no quality loss), ON for reasoning/planning/compose (quality).
     #[serde(default)]
     pub think: Option<bool>,
+    /// Route this call to the pool's strong "reasoner" backend, INDEPENDENT of `think`. A big model
+    /// can be capable enough for a hard turn without the huge (GPU-hogging) thinking preamble — so an
+    /// escalation sets this true while keeping think=false: strong model, fast generation, no queue.
+    #[serde(default)]
+    pub prefer_reasoner: bool,
 }
 
 impl Default for GenerationConfig {
@@ -162,6 +167,7 @@ impl Default for GenerationConfig {
             stop: vec![],
             max_context: None,
             think: None,
+            prefer_reasoner: false,
         }
     }
 }
