@@ -133,6 +133,17 @@ impl GenericOpenAIBackend {
         Self::new(base_url, api_key, model, auth_style, presets)
     }
 
+    /// Per-workload thinking control (builder). `true` lets the model reason (higher quality,
+    /// slower); `false` suppresses the reasoning preamble (faster/cheaper). On qwen3.6 MoE this
+    /// is a BINARY accuracy trade — the maintainer confirmed reasoning_effort low/medium/high are
+    /// accepted but don't scale, so on/off per workload is the only real lever. Prefer `true` on
+    /// planning / grounded-reasoning paths; reserve `false` for clearly-trivial latency-critical
+    /// turns. Applied post-construction, so it also overrides the :11434 auto-detect default.
+    pub fn with_thinking(mut self, enabled: bool) -> Self {
+        self.presets.disable_thinking = !enabled;
+        self
+    }
+
     /// Serialize a ChatMessage to JSON.
     fn serialize_message(m: &ChatMessage, ollama_compat: bool) -> serde_json::Value {
         let mut msg = serde_json::json!({ "role": m.role });
