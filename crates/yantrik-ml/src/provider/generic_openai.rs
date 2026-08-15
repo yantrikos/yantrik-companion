@@ -325,6 +325,16 @@ impl GenericOpenAIBackend {
         let json: serde_json::Value = resp_body.read_json()?;
         let message = &json["message"];
         let text = message["content"].as_str().unwrap_or("").to_string();
+        // Reasoning comes back as its OWN field, not as <think> tags in the content — so it is
+        // invisible to any tag-splitting the caller does, and dropping it here is silent. This is
+        // the backend the mind's local lane actually uses, so this line is what decides whether the
+        // cockpit's reasoning fold has anything to show.
+        let thinking = message["thinking"]
+            .as_str()
+            .or_else(|| message["reasoning"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
         let eval_count = json["eval_count"].as_u64().unwrap_or(0) as usize;
         let prompt_eval_count = json["prompt_eval_count"].as_u64().unwrap_or(0) as usize;
@@ -337,7 +347,7 @@ impl GenericOpenAIBackend {
         };
 
         Ok(LLMResponse {
-            thinking: String::new(),
+            thinking,
             text,
             prompt_tokens: prompt_eval_count,
             completion_tokens: eval_count,
