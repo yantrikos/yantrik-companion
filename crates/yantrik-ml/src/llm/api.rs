@@ -134,9 +134,18 @@ impl ApiLLM {
             "options": options,
         });
 
-        // Disable thinking mode for families that need it (Qwen, Nemotron, etc.)
-        if self.template().disable_thinking() {
-            body["think"] = serde_json::json!(false);
+        // THINKING: the CALLER'S EXPLICIT CHOICE WINS; the family default applies only when the
+        // caller expressed none.
+        //
+        // `config.think` was not read here at all — the only rule was "Qwen/Nemotron get
+        // think:false" — so every per-call override was discarded before it reached the wire, and
+        // thinking could not be turned on for those families by any means. GenerationConfig.think
+        // existed, the YM_THINK_* env knobs resolved to Some(true) correctly, and none of it
+        // survived this function.
+        match config.think {
+            Some(t) => body["think"] = serde_json::json!(t),
+            None if self.template().disable_thinking() => body["think"] = serde_json::json!(false),
+            None => {}
         }
 
         if let Some(tools) = tools {
