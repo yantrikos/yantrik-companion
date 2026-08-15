@@ -243,6 +243,10 @@ impl ApiLLM {
         let message = &json["message"];
         let raw_text = message["content"].as_str().unwrap_or("").to_string();
         let text = strip_think_tags(&raw_text);
+        // Reasoning arrives as its OWN field on models that separate it (qwen3.8 and friends), not
+        // as `<think>` tags inside the content — `strip_think_tags` above finds nothing to strip
+        // and the reasoning was being dropped here, unseen. Carry it so a caller can show it.
+        let thinking = message["thinking"].as_str().unwrap_or("").trim().to_string();
 
         let eval_count = json["eval_count"].as_u64().unwrap_or(0) as usize;
         let prompt_eval_count = json["prompt_eval_count"].as_u64().unwrap_or(0) as usize;
@@ -256,6 +260,7 @@ impl ApiLLM {
         };
 
         Ok(LLMResponse {
+            thinking,
             text,
             prompt_tokens: prompt_eval_count,
             completion_tokens: eval_count,
@@ -388,6 +393,7 @@ impl ApiLLM {
         };
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: full_text,
             prompt_tokens: 0,
             completion_tokens: eval_count,
@@ -692,6 +698,7 @@ impl ApiLLM {
         let tool_calls = api_tool_calls.iter().filter_map(ToolCall::from_api).collect();
 
         LLMResponse {
+            thinking: String::new(),
             text,
             prompt_tokens,
             completion_tokens,
@@ -806,6 +813,7 @@ impl ApiLLM {
         let tool_calls = api_tool_calls.iter().filter_map(ToolCall::from_api).collect();
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: full_text,
             prompt_tokens,
             completion_tokens,
@@ -929,6 +937,16 @@ impl LLMBackend for ApiLLM {
         let text = strip_think_tags(
             message["content"].as_str().unwrap_or("")
         );
+        // The OpenAI-compatible spelling of the same thing. Ollama's /v1 endpoint puts the
+        // preamble in `reasoning` (see `reasoning_effort` above); cloud reasoning models use
+        // `reasoning_content`. Either way it is separate from `content`, so tag-stripping cannot
+        // reach it and it was being discarded.
+        let thinking = message["reasoning"]
+            .as_str()
+            .or_else(|| message["reasoning_content"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
         let prompt_tokens = json["usage"]["prompt_tokens"]
             .as_u64()
@@ -954,6 +972,7 @@ impl LLMBackend for ApiLLM {
         };
 
         Ok(LLMResponse {
+            thinking,
             text,
             prompt_tokens,
             completion_tokens,
@@ -1104,6 +1123,7 @@ impl LLMBackend for ApiLLM {
         };
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: full_text,
             prompt_tokens: 0,
             completion_tokens: 0,

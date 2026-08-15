@@ -279,6 +279,7 @@ impl LLMBackend for ClaudeCliLLM {
         };
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: clean_text,
             prompt_tokens: 0,
             completion_tokens: text.len() / 4, // rough estimate

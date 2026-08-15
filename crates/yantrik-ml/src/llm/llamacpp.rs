@@ -308,6 +308,7 @@ impl LlamaCppLLM {
         let tool_calls = chat_templates::template_for_family(family).parse_tool_calls(&generated_text);
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: generated_text,
             prompt_tokens: prompt_len,
             completion_tokens,
@@ -434,6 +435,7 @@ impl LlamaCppLLM {
         let tool_calls = chat_templates::template_for_family(family).parse_tool_calls(&generated_text);
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: generated_text,
             prompt_tokens: prompt_len,
             completion_tokens,

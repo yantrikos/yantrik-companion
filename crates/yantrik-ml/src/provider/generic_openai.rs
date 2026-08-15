@@ -337,6 +337,7 @@ impl GenericOpenAIBackend {
         };
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text,
             prompt_tokens: prompt_eval_count,
             completion_tokens: eval_count,
@@ -396,6 +397,7 @@ impl GenericOpenAIBackend {
         };
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: full_text,
             prompt_tokens: 0,
             completion_tokens: eval_count,
@@ -501,6 +503,7 @@ impl GenericOpenAIBackend {
         };
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text,
             prompt_tokens,
             completion_tokens,
@@ -591,6 +594,7 @@ impl GenericOpenAIBackend {
         };
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: full_text,
             prompt_tokens: 0,
             completion_tokens: 0,

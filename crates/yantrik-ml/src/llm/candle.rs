@@ -321,6 +321,7 @@ impl CandleLLM {
         let tool_calls = chat_template::parse_tool_calls(&generated_text);
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: generated_text,
             prompt_tokens: prompt_len,
             completion_tokens,
@@ -457,6 +458,7 @@ impl CandleLLM {
         let tool_calls = chat_template::parse_tool_calls(&generated_text);
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: generated_text,
             prompt_tokens: prompt_len,
             completion_tokens,

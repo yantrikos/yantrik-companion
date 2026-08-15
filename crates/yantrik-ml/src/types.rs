@@ -187,10 +187,18 @@ impl GenerationConfig {
 // ── LLM response ───────────────────────────────────────────────────────
 
 /// Response from a generation call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LLMResponse {
     /// The generated text (full output).
     pub text: String,
+    /// The model's REASONING, when the backend returns it as its own field.
+    ///
+    /// Newer models hand reasoning back structurally (Ollama's `message.thinking`) instead of
+    /// wrapping it in `<think>` tags inside `text`. Without somewhere to put it, that content was
+    /// simply dropped at this layer — so a caller could enable thinking, pay for it, and still have
+    /// nothing to show. Empty when the backend does not separate it, in which case the text may
+    /// still carry tag-delimited reasoning for the caller to split out.
+    pub thinking: String,
     /// Number of prompt tokens processed.
     pub prompt_tokens: usize,
     /// Number of tokens generated.

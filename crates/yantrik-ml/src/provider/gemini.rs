@@ -338,6 +338,7 @@ impl LLMBackend for GoogleGeminiBackend {
         };
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text,
             prompt_tokens,
             completion_tokens,
@@ -424,6 +425,7 @@ impl LLMBackend for GoogleGeminiBackend {
         };
 
         Ok(LLMResponse {
+            thinking: String::new(),
             text: full_text,
             prompt_tokens,
             completion_tokens,
