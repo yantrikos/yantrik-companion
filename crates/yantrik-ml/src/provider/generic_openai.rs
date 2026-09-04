@@ -208,7 +208,7 @@ impl GenericOpenAIBackend {
     fn build_agent(&self) -> ureq::Agent {
         ureq::Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(Some(std::time::Duration::from_secs(300)))
+                .timeout_global(Some(crate::call_timeout::call_timeout()))
                 .build()
         )
     }

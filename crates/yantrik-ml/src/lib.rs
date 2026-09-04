@@ -30,6 +30,8 @@ mod token_stream;
 
 // LLM backend modules
 mod llm;
+/// The wall-clock ceiling on one model call, shared by every HTTP client in this crate.
+pub mod call_timeout;
 
 // Provider registry (multi-provider management, secret storage, key validation)
 #[cfg(feature = "api-llm")]
