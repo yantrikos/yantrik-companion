@@ -40,7 +40,7 @@ impl ModelTier {
         if let Some(params_b) = Self::extract_param_count(model) {
             match params_b {
                 x if x < 1.5 => ModelTier::Tiny,
-                x if x < 4.0 => ModelTier::Small,
+                x if x <= 4.0 => ModelTier::Small,
                 x if x < 14.0 => ModelTier::Medium,
                 _ => ModelTier::Large,
             }
@@ -332,7 +332,13 @@ impl ModelCapabilityProfile {
 
         // Models with native tool calling support via their API provider.
         // Override StructuredJSON → NativeFunctionCall so Ollama handles the tool template.
-        if profile.family.supports_native_tools() {
+        // Only the tiers that can hold a full tool set. Tiny and Small keep MCQ on purpose:
+        // that mode exists because a small model is overwhelmed by many tools at once, and a
+        // family flag says nothing about capacity. (This override is a local addition; upstream
+        // has none, and it silently broke the tier rule for every small Qwen.)
+        if profile.family.supports_native_tools()
+            && matches!(tier, ModelTier::Medium | ModelTier::Large)
+        {
             profile.tool_call_mode = ToolCallMode::NativeFunctionCall;
         }
 
@@ -614,8 +620,8 @@ impl ModelCapabilityProfile {
         format!(
             "{}(~{:.1}B) family={} tools={} mode={:?} ctx={}K steps={} family_routing={}",
             self.tier,
-            self.family,
             self.estimated_params_b,
+            self.family,
             self.max_tools_per_prompt,
             self.tool_call_mode,
             self.max_effective_context / 1024,
@@ -674,7 +680,7 @@ impl ToolFamily {
             ],
             ToolFamily::Schedule => &[
                 "calendar", "event", "meeting", "schedule", "appointment",
-                "today", "tomorrow", "free time", "busy", "agenda",
+                "free time", "busy", "agenda",
                 "recipe", "automation", "cron",
             ],
             ToolFamily::Remember => &[
@@ -690,7 +696,7 @@ impl ToolFamily {
                 "grep", "glob", "code", "script", "save file",
             ],
             ToolFamily::System => &[
-                "system", "process", "disk", "cpu", "reminder", "timer",
+                "deploy", "run the", "system", "process", "disk", "cpu", "reminder", "timer",
                 "alarm", "uptime", "run command", "execute", "screenshot",
                 "vault", "password", "credential", "secret", "pin",
             ],
@@ -769,7 +775,10 @@ impl ToolFamily {
                 let matches = keywords.iter()
                     .filter(|kw| query_lower.contains(**kw))
                     .count();
-                let score = matches as f64 / keywords.len() as f64;
+                // RAW count. This was `matches / keywords.len()`, which let the family with the
+                // SHORTER table win every tie by construction -- adding a keyword to a family
+                // made it LESS likely to be chosen. Ties now fall to `ALL` order, which is stable.
+                let score = matches as f64;
                 (family, score)
             })
             .filter(|(_, score)| *score > 0.0)
@@ -849,7 +858,10 @@ mod tests {
         let medium = ModelCapabilityProfile::from_model_name("qwen3.5:9b");
         assert_eq!(medium.tier, ModelTier::Medium);
         assert_eq!(medium.max_tools_per_prompt, 25);
-        assert_eq!(medium.tool_call_mode, ToolCallMode::StructuredJSON);
+        // Native, not StructuredJSON: the vendored copy deliberately overrides capable
+        // families to native tool calls (kept for Medium/Large in E.DARK1); this assertion
+        // predates that and was stale.
+        assert_eq!(medium.tool_call_mode, ToolCallMode::NativeFunctionCall);
         assert!(medium.multi_step_capable);
         assert!(medium.use_family_routing);
         assert_eq!(medium.max_agent_steps, 10);
@@ -923,7 +935,7 @@ mod tests {
         let s = p.summary();
         assert!(s.contains("medium"));
         assert!(s.contains("9.0B"));
-        assert!(s.contains("StructuredJSON"));
+        assert!(s.contains("NativeFunctionCall")); // see profile_from_model_name
 
         // Yantrik 9B → NativeFunctionCall
         let y = ModelCapabilityProfile::from_model_name("yantrik-9b-v3");
@@ -957,5 +969,39 @@ mod tests {
         // Model with version number that looks like params
         assert_eq!(ModelTier::from_model_name("qwen3.5:7b"), ModelTier::Medium);
         assert_eq!(ModelTier::from_model_name("phi-4:3.8b"), ModelTier::Small);
+    }
+}
+
+#[cfg(test)]
+mod dark_fixes_tests {
+    use super::*;
+
+    /// E.DARK1 kill criterion 3: restricting the native-tools override to Medium/Large must not
+    /// downgrade the tiers it was written for. A capable Qwen keeps native function calling.
+    #[test]
+    fn medium_and_large_native_families_still_get_native_tool_calls() {
+        let m = ModelCapabilityProfile::from_model_name("qwen3.5:9b");
+        let l = ModelCapabilityProfile::from_model_name("qwen3.5:27b");
+        assert_eq!(m.tool_call_mode, ToolCallMode::NativeFunctionCall, "medium qwen: {:?}", m.tool_call_mode);
+        assert_eq!(l.tool_call_mode, ToolCallMode::NativeFunctionCall, "large qwen: {:?}", l.tool_call_mode);
+        // And the reason the override was restricted: a tiny one must NOT be overridden.
+        let t = ModelCapabilityProfile::from_model_name("qwen3.5:0.6b");
+        assert!(t.uses_mcq(), "tiny must keep MCQ regardless of family: {:?}", t.tool_call_mode);
+    }
+
+    /// E.DARK1 kill criterion 2 target: MORE matched keywords must beat FEWER, regardless of how
+    /// long each family's table is. The old scorer divided by table length, so the family with the
+    /// shorter list won ties -- and could win outright with fewer matches. Two World hits against
+    /// one Communicate hit must go to World.
+    #[test]
+    fn the_score_is_a_raw_match_count_not_a_fraction_of_the_table() {
+        // Two World keywords match; the score must be exactly 2.0. Under the old scorer it was
+        // 2 / keywords.len() -- a fraction that made the family with the SHORTER table win ties
+        // by construction. Pinning the value is what lets the mutant (reverting to the fraction)
+        // fail by name, without hunting for a query whose tables happen to discriminate.
+        let r = ToolFamily::route_query("what's the weather forecast");
+        assert_eq!(r.first().map(|x| (x.0, x.1)), Some((ToolFamily::World, 2.0)), "{r:?}");
+        // Observed while writing this: matching is substring, so "email" also hits "mail". That
+        // is upstream behaviour and not one of the six defects; noted, not changed here.
     }
 }

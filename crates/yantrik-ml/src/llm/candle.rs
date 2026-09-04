@@ -507,7 +507,8 @@ mod tests {
     #[test]
     fn test_generation_config_default() {
         let config = GenerationConfig::default();
-        assert_eq!(config.max_tokens, 512);
+        // 2048 here AND in upstream yantrikos/yantrik-ml; this test was stale on both sides.
+        assert_eq!(config.max_tokens, 2048);
         assert!((config.temperature - 0.7).abs() < 0.001);
         assert_eq!(config.top_p, Some(0.9));
     }
