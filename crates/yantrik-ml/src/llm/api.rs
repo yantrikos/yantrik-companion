@@ -196,6 +196,7 @@ impl ApiLLM {
                 tracing::error!(error = %e, body_bytes = body_str.len(), tools = tool_count, "Ollama API request failed");
                 e
             })
+            .map_err(|e| crate::call_timeout::describe_send_error(&self.model, e))
             .context("Ollama API request failed")?;
 
         let status = resp.status();
@@ -873,6 +874,7 @@ impl ApiLLM {
 
         let resp = req
             .send(body_str.as_bytes())
+            .map_err(|e| crate::call_timeout::describe_send_error(&self.model, e))
             .context("API request failed")?;
 
         let status = resp.status();

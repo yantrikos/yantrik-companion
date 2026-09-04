@@ -308,6 +308,7 @@ impl GenericOpenAIBackend {
                 tracing::error!(error = %e, "Ollama API request failed");
                 e
             })
+            .map_err(|e| crate::call_timeout::describe_send_error(&self.model, e))
             .context("Ollama API request failed")?;
 
         Ok(resp.into_body())
@@ -483,6 +484,7 @@ impl GenericOpenAIBackend {
 
         let resp = req
             .send(body_str.as_bytes())
+            .map_err(|e| crate::call_timeout::describe_send_error(&self.model, e))
             .context("OpenAI-compatible API request failed")?;
 
         Ok(resp.into_body())

@@ -48,9 +48,46 @@ pub fn call_timeout() -> std::time::Duration {
     ))
 }
 
+/// The sentence a client writes when ITS call timed out: the seconds it actually waited and the
+/// model it waited for (E.MSG2). One source of truth, at the site that knows both — the lane
+/// above relays it instead of guessing from a model-less knob (which said "300 s" for a 5 s
+/// per-model timeout on 2026-09-04).
+pub fn timeout_sentence(model: &str, secs: u64) -> String {
+    format!("timed out after {secs} s waiting for {model} (YM_LLM_TIMEOUT_MODELS / YM_LLM_TIMEOUT_S)")
+}
+
+/// Turn a transport error into the error the caller sees: a ureq timeout becomes the sentence
+/// above; anything else passes through unchanged.
+#[cfg(feature = "api-llm")]
+pub fn describe_send_error(model: &str, e: ureq::Error) -> anyhow::Error {
+    match e {
+        ureq::Error::Timeout(_) => {
+            anyhow::anyhow!("{}", timeout_sentence(model, call_timeout_for(model).as_secs()))
+        }
+        other => anyhow::Error::from(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_timeout_sentence_names_the_seconds_the_model_and_both_knobs() {
+        let t = timeout_sentence("qwen3.8:27b-q4_K_M", 5);
+        assert!(t.starts_with("timed out after 5 s"), "{t}");
+        assert!(t.contains("qwen3.8:27b-q4_K_M") && t.contains("YM_LLM_TIMEOUT_MODELS") && t.contains("YM_LLM_TIMEOUT_S"), "{t}");
+    }
+
+    #[cfg(feature = "api-llm")]
+    #[test]
+    fn a_ureq_timeout_becomes_the_sentence_and_other_errors_pass_through() {
+        let e = describe_send_error("qwen3.8:27b", ureq::Error::Timeout(ureq::Timeout::Global));
+        let text = format!("{e:#}");
+        assert!(text.contains("timed out after ") && text.contains("qwen3.8:27b"), "{text}");
+        let other = describe_send_error("m", ureq::Error::HostNotFound);
+        assert!(!format!("{other:#}").contains("timed out after"), "{other:#}");
+    }
 
     #[test]
     fn precedence_is_per_model_then_global_then_profile_then_default() {
