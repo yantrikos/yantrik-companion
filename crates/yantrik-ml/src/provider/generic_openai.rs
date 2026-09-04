@@ -684,3 +684,29 @@ impl LLMBackend for GenericOpenAIBackend {
         &self.model
     }
 }
+
+#[cfg(test)]
+mod think_body_tests {
+    use super::*;
+    use crate::types::{ChatMessage, GenerationConfig};
+
+    fn bodies(cfg_think: Option<bool>) -> (serde_json::Value, serde_json::Value) {
+        let b = GenericOpenAIBackend::for_provider("ollama", "http://127.0.0.1:11434", None, "qwen3.8:27b-q4_K_M");
+        let msgs = vec![ChatMessage::user("hi")];
+        let cfg = GenerationConfig { think: cfg_think, ..GenerationConfig::default() };
+        (b.build_ollama_body(&msgs, &cfg, None, false), b.build_openai_body(&msgs, &cfg, None, false))
+    }
+
+    /// E.THINKOBS1: the request body is the last code before the wire, so it is the observable.
+    #[test]
+    fn a_per_model_entry_reaches_both_request_bodies_and_beats_the_caller() {
+        std::env::set_var("YM_THINK_MODELS", "qwen3.8=off");
+        let (native, openai) = bodies(Some(true));
+        std::env::remove_var("YM_THINK_MODELS");
+        assert_eq!(native["think"], serde_json::json!(false), "{native}");
+        assert_eq!(openai["think"], serde_json::json!(false), "{openai}");
+        assert_eq!(openai["reasoning_effort"], serde_json::json!("none"), "{openai}");
+        let (native2, _) = bodies(Some(true));
+        assert_eq!(native2["think"], serde_json::json!(true), "without the entry the caller's request stands: {native2}");
+    }
+}
