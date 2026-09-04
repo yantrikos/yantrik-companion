@@ -285,6 +285,16 @@ pub struct ModelCapabilityProfile {
     pub can_summarize_freely: bool,
     /// Whether to run hallucination firewall on all factual responses.
     pub hallucination_firewall: bool,
+
+    // ── Per-model generation knobs (E.PROFILE1) ────────────────────
+    /// The thinking default this model should get when the caller expressed no preference and no
+    /// `YM_THINK_MODELS` entry names it. `None` = unmeasured; the provider preset decides.
+    /// Measured 2026-09-04 (n=5): thinking divides by model AND provider, so this is per model.
+    pub think_default: Option<bool>,
+    /// The per-call timeout this model earns when neither `YM_LLM_TIMEOUT_MODELS` nor
+    /// `YM_LLM_TIMEOUT_S` says otherwise. `None` = the compiled default (300 s). Measured: a 27B
+    /// thinking model authored a project in 312 s on the local lane, past the 300 s default.
+    pub call_timeout_s: Option<u64>,
 }
 
 impl ModelCapabilityProfile {
@@ -375,6 +385,8 @@ impl ModelCapabilityProfile {
             llm_nudge_polish: false,
             can_summarize_freely: false,
             hallucination_firewall: true,
+            think_default: None,
+            call_timeout_s: None,
         }
     }
 
@@ -407,6 +419,8 @@ impl ModelCapabilityProfile {
             llm_nudge_polish: false,
             can_summarize_freely: false,
             hallucination_firewall: true,
+            think_default: None,
+            call_timeout_s: None,
         }
     }
 
@@ -439,6 +453,8 @@ impl ModelCapabilityProfile {
             llm_nudge_polish: false,
             can_summarize_freely: false,
             hallucination_firewall: true,
+            think_default: None,
+            call_timeout_s: None,
         }
     }
 
@@ -471,6 +487,8 @@ impl ModelCapabilityProfile {
             llm_nudge_polish: true,
             can_summarize_freely: true,
             hallucination_firewall: true,
+            think_default: None,
+            call_timeout_s: None,
         }
     }
 
@@ -542,6 +560,8 @@ impl ModelCapabilityProfile {
             llm_nudge_polish: params >= 4.0,
             can_summarize_freely: params >= 4.0,
             hallucination_firewall: params < 14.0,
+            think_default: None,
+            call_timeout_s: None,
         }
     }
 
@@ -574,6 +594,8 @@ impl ModelCapabilityProfile {
             llm_nudge_polish: true,
             can_summarize_freely: true,
             hallucination_firewall: false, // large models hallucinate less
+            think_default: None,
+            call_timeout_s: Some(600),
         }
     }
 

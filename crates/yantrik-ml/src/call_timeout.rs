@@ -1,55 +1,106 @@
-//! The wall-clock ceiling on one model call, as a KNOB shared by every HTTP client here.
+//! The per-call timeout every HTTP client in this crate uses. One knob, one place, so a local
+//! lane that takes 312 s to author a project (measured) is a configuration, not a code change.
 //!
-//! E.TIMEOUT1 put this on `llm/api.rs` (`ApiLLM`) only. That path is referenced from a single test
-//! in the consumer, so the release binary strips it — and the LOCAL lane, the one that measured
-//! 312 s and was cut, goes through `provider/generic_openai.rs`, which carried its own hardcoded
-//! 300 s the knob never reached. `strings` on the deployed binary showed `YM_LLM_TIMEOUT_S` 0 times.
-//! So the helper lives here, feature-independent, and BOTH clients call it.
-//!
-//! `YM_LLM_TIMEOUT_S` overrides; **the default is the same 300 s**, so an unset environment behaves
-//! exactly as before. Every malformed value — empty, non-numeric, zero, beyond a day — falls back
-//! to the default, never to something shorter: a typo must not turn a working lane into one that
-//! fails closed, silently.
+//! Precedence (E.PROFILE1): `YM_LLM_TIMEOUT_MODELS` ("qwen3.8=600,gpt-oss=120", matched by
+//! substring of the model name) → `YM_LLM_TIMEOUT_S` (global) → the model's
+//! `ModelCapabilityProfile::call_timeout_s` (measured per tier) → 300 s.
 
+const DEFAULT_SECS: u64 = 300;
+const MAX_SECS: u64 = 86_400;
+
+fn parse_secs(v: &str) -> Option<u64> {
+    v.trim().parse::<u64>().ok().filter(|s| *s > 0 && *s <= MAX_SECS)
+}
+
+/// Pure precedence, so it is testable without env races.
+pub fn resolve_timeout_secs(
+    model: &str,
+    per_model_csv: Option<&str>,
+    global: Option<&str>,
+    profile_secs: Option<u64>,
+) -> u64 {
+    per_model_csv
+        .and_then(|csv| crate::model_overrides::lookup(csv, model))
+        .and_then(parse_secs)
+        .or_else(|| global.and_then(parse_secs))
+        .or(profile_secs)
+        .unwrap_or(DEFAULT_SECS)
+}
+
+/// The timeout for a call to `model`: the per-model env, the global env, the profile, 300 s.
+pub fn call_timeout_for(model: &str) -> std::time::Duration {
+    let profile = crate::capability::ModelCapabilityProfile::from_model_name(model).call_timeout_s;
+    std::time::Duration::from_secs(resolve_timeout_secs(
+        model,
+        std::env::var("YM_LLM_TIMEOUT_MODELS").ok().as_deref(),
+        std::env::var("YM_LLM_TIMEOUT_S").ok().as_deref(),
+        profile,
+    ))
+}
+
+/// The model-less timeout: `YM_LLM_TIMEOUT_S`, else 300 s. For callers that have no model name.
 pub fn call_timeout() -> std::time::Duration {
-    const DEFAULT_SECS: u64 = 300;
-    let secs = std::env::var("YM_LLM_TIMEOUT_S")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|s| *s > 0 && *s <= 86_400)
-        .unwrap_or(DEFAULT_SECS);
-    std::time::Duration::from_secs(secs)
+    std::time::Duration::from_secs(resolve_timeout_secs(
+        "",
+        None,
+        std::env::var("YM_LLM_TIMEOUT_S").ok().as_deref(),
+        None,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::call_timeout;
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn with_env(value: Option<&str>, f: impl FnOnce()) {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("YM_LLM_TIMEOUT_S").ok();
-        match value { Some(v) => std::env::set_var("YM_LLM_TIMEOUT_S", v), None => std::env::remove_var("YM_LLM_TIMEOUT_S") }
-        f();
-        match prev { Some(p) => std::env::set_var("YM_LLM_TIMEOUT_S", p), None => std::env::remove_var("YM_LLM_TIMEOUT_S") }
-    }
-    #[test] fn unset_is_the_previous_constant() { with_env(None, || assert_eq!(call_timeout(), std::time::Duration::from_secs(300))); }
-    #[test] fn a_valid_value_is_honoured() { with_env(Some("900"), || assert_eq!(call_timeout(), std::time::Duration::from_secs(900))); }
-    #[test] fn every_malformed_value_falls_back_never_shorter() {
-        for bad in ["", "   ", "abc", "-5", "0", "12.5", "300s", "99999999", "1e3", "86401"] {
-            with_env(Some(bad), || assert_eq!(call_timeout(), std::time::Duration::from_secs(300), "{bad:?}"));
-        }
-    }
-    /// EVERY client must use the knob. E.TIMEOUT1 wired three sites in one client and missed the
-    /// client the product actually runs; this counts across BOTH files, cut at their test modules
-    /// so the assertion strings below cannot match themselves.
+    use super::*;
+
     #[test]
-    fn every_timeout_site_in_every_client_uses_the_knob() {
-        for (name, whole) in [("llm/api.rs", include_str!("llm/api.rs")), ("provider/generic_openai.rs", include_str!("provider/generic_openai.rs"))] {
-            let src = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+    fn precedence_is_per_model_then_global_then_profile_then_default() {
+        let m = "qwen3.8:27b-q4_K_M";
+        assert_eq!(resolve_timeout_secs(m, Some("qwen3.8=900"), Some("120"), Some(600)), 900);
+        assert_eq!(resolve_timeout_secs(m, Some("gpt-oss=900"), Some("120"), Some(600)), 120);
+        assert_eq!(resolve_timeout_secs(m, None, None, Some(600)), 600);
+        assert_eq!(resolve_timeout_secs(m, None, None, None), 300);
+    }
+
+    #[test]
+    fn a_bad_value_at_any_level_falls_through_to_the_next() {
+        let m = "qwen3.8:27b";
+        assert_eq!(resolve_timeout_secs(m, Some("qwen3.8=lots"), Some("120"), None), 120);
+        assert_eq!(resolve_timeout_secs(m, Some("qwen3.8=0"), Some("0"), Some(600)), 600);
+        assert_eq!(resolve_timeout_secs(m, Some("qwen3.8=99999999"), Some("-1"), None), 300);
+    }
+
+    #[test]
+    fn the_large_tier_profile_earns_a_longer_timeout_and_a_medium_one_does_not() {
+        use crate::capability::ModelCapabilityProfile as P;
+        assert_eq!(P::from_model_name("qwen3.8:27b-q4_K_M").call_timeout_s, Some(600), "312 s was measured");
+        // The tier boundary is the crate's (>= 14B is Large), so a 20B model earns it too.
+        assert_eq!(P::from_model_name("gpt-oss-backup:20b").call_timeout_s, Some(600));
+        assert_eq!(P::from_model_name("qwen3.5:9b").call_timeout_s, None, "Medium: unmeasured, default");
+        assert_eq!(P::from_model_name("gemma4:e4b").call_timeout_s, None);
+    }
+
+    #[test]
+    fn the_model_less_knob_is_the_global_env_or_300() {
+        // Not env-mutating: the pure core with the same shape the wrapper uses.
+        assert_eq!(resolve_timeout_secs("", None, Some("900"), None), 900);
+        assert_eq!(resolve_timeout_secs("", None, None, None), 300);
+    }
+
+    /// Every HTTP client in this crate — the legacy `ApiLLM` and the `provider/` backends — must
+    /// take its timeout from the model-aware knob. E.TIMEOUT1 put the knob on a dead path while
+    /// the live lane kept its own 300 s; E.PROFILE1 makes the model part of the answer, so the
+    /// model-less `call_timeout()` is no longer acceptable at a client site either.
+    #[test]
+    fn every_timeout_site_in_every_client_uses_the_model_aware_knob() {
+        for file in ["src/llm/api.rs", "src/provider/generic_openai.rs"] {
+            let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/").to_string() + file).unwrap();
+            let src = src.split("#[cfg(test)]").next().unwrap_or("");
             let literal = src.matches(".timeout_global(Some(std::time::Duration::from_secs(").count();
-            assert_eq!(literal, 0, "{name} still hardcodes a call timeout");
-            let wired = src.matches("call_timeout()").count();
-            assert!(wired >= 1, "{name} never calls the knob");
+            let model_less = src.matches("call_timeout()").count();
+            let wired = src.matches("call_timeout_for(&self.model)").count();
+            assert_eq!(literal, 0, "{file} still hardcodes a call timeout");
+            assert_eq!(model_less, 0, "{file} uses the model-less knob at a client site");
+            assert!(wired >= 1, "{file} has no model-aware timeout site");
         }
     }
 }

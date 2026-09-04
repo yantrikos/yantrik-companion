@@ -142,7 +142,7 @@ impl ApiLLM {
         // thinking could not be turned on for those families by any means. GenerationConfig.think
         // existed, the YM_THINK_* env knobs resolved to Some(true) correctly, and none of it
         // survived this function.
-        match config.think {
+        match crate::think_policy::think_for_model(&self.model, config.think) {
             Some(t) => body["think"] = serde_json::json!(t),
             None if self.template().disable_thinking() => body["think"] = serde_json::json!(false),
             None => {}
@@ -172,13 +172,13 @@ impl ApiLLM {
 
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(Some(crate::call_timeout::call_timeout()))
+                .timeout_global(Some(crate::call_timeout::call_timeout_for(&self.model)))
                 .build()
         );
 
         let agent_no_err = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(Some(crate::call_timeout::call_timeout()))
+                .timeout_global(Some(crate::call_timeout::call_timeout_for(&self.model)))
                 .http_status_as_error(false)
                 .build()
         );
@@ -853,7 +853,7 @@ impl ApiLLM {
 
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(Some(crate::call_timeout::call_timeout()))
+                .timeout_global(Some(crate::call_timeout::call_timeout_for(&self.model)))
                 .http_status_as_error(false)
                 .build()
         );

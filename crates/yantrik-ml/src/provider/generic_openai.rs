@@ -208,7 +208,7 @@ impl GenericOpenAIBackend {
     fn build_agent(&self) -> ureq::Agent {
         ureq::Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(Some(crate::call_timeout::call_timeout()))
+                .timeout_global(Some(crate::call_timeout::call_timeout_for(&self.model)))
                 .build()
         )
     }
@@ -274,7 +274,7 @@ impl GenericOpenAIBackend {
         // Per-call think override (config.think) wins over the provider preset — Ollama honors
         // `think` in the request body, which is what enables dual-mode from a single model tag:
         // OFF for tool-selection dispatch, ON for reasoning/compose. None => preset default.
-        match config.think {
+        match crate::think_policy::think_for_model(&self.model, config.think) {
             Some(t) => body["think"] = serde_json::json!(t),
             None if self.presets.disable_thinking => body["think"] = serde_json::json!(false),
             None => {}
@@ -451,7 +451,7 @@ impl GenericOpenAIBackend {
 
         // Per-call think override wins over the preset (see build_ollama_body). On the OpenAI-compat
         // path Ollama ignores `think`, so also emit reasoning_effort:"none" when forcing OFF.
-        match config.think {
+        match crate::think_policy::think_for_model(&self.model, config.think) {
             Some(true) => { body["think"] = serde_json::json!(true); }
             Some(false) => { body["think"] = serde_json::json!(false); body["reasoning_effort"] = serde_json::json!("none"); }
             None if self.presets.disable_thinking => { body["think"] = serde_json::json!(false); body["reasoning_effort"] = serde_json::json!("none"); }
