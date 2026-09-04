@@ -1,3 +1,13 @@
+# Standalone workspace on purpose.
+#
+# This crate is consumed as a GIT dependency with a `[patch]` pointing here, so it is deliberately
+# not a member of yantrik-companion's workspace. Without its own `[workspace]` table it inherited
+# the parent's and cargo refused every command with "current package believes it's in a workspace
+# when it's not" -- which meant `cargo test` could not run AT ALL, and the crate's existing tests
+# (13 in capability.rs alone) were dark. Nothing about how it is consumed changes; this only lets
+# its own suite execute.
+[workspace]
+
 [package]
 name = "yantrik-ml"
 version = "0.1.0"
