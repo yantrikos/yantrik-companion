@@ -27,6 +27,30 @@ pub struct ApiLLM {
     family: ModelFamily,
 }
 
+/// The wall-clock ceiling on one model call, as a KNOB rather than a constant.
+///
+/// This was `Duration::from_secs(300)` written out at three call sites. Measured 2026-09-04 on real
+/// authoring work: 300 s is INSUFFICIENT for a 27B local model (a benchmark task measured 312 s and
+/// was cut, disqualifying three legs) and generous for a 20B (179.7 s on the same task). One
+/// constant cannot serve both, and changing it meant rebuilding every box.
+///
+/// `YM_LLM_TIMEOUT_S` overrides it. **The default is the same 300 s**, so an unset environment
+/// behaves exactly as before -- this is a constant becoming a knob, not a new policy.
+///
+/// EVERY malformed value falls back to the default: empty, non-numeric, zero, or beyond a day. The
+/// direction is deliberate. A typo must never yield a SHORTER timeout than today, because that
+/// turns a working lane into one that fails closed -- precisely the failure this exists to make
+/// configurable, and it would arrive silently.
+fn call_timeout() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 300;
+    let secs = std::env::var("YM_LLM_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0 && *s <= 86_400)
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 impl ApiLLM {
     pub fn new(base_url: impl Into<String>, api_key: Option<String>, model: impl Into<String>) -> Self {
         let base_url: String = base_url.into();
@@ -172,13 +196,13 @@ impl ApiLLM {
 
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(Some(std::time::Duration::from_secs(300)))
+                .timeout_global(Some(call_timeout()))
                 .build()
         );
 
         let agent_no_err = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(Some(std::time::Duration::from_secs(300)))
+                .timeout_global(Some(call_timeout()))
                 .http_status_as_error(false)
                 .build()
         );
@@ -853,7 +877,7 @@ impl ApiLLM {
 
         let agent = ureq::Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(Some(std::time::Duration::from_secs(300)))
+                .timeout_global(Some(call_timeout()))
                 .http_status_as_error(false)
                 .build()
         );
@@ -1152,5 +1176,97 @@ impl LLMBackend for ApiLLM {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+}
+
+#[cfg(test)]
+mod call_timeout_tests {
+    use super::*;
+
+    /// The process environment is global, so these must not run concurrently.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env(value: Option<&str>, f: impl FnOnce()) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("YM_LLM_TIMEOUT_S").ok();
+        match value {
+            Some(v) => std::env::set_var("YM_LLM_TIMEOUT_S", v),
+            None => std::env::remove_var("YM_LLM_TIMEOUT_S"),
+        }
+        f();
+        match prev {
+            Some(p) => std::env::set_var("YM_LLM_TIMEOUT_S", p),
+            None => std::env::remove_var("YM_LLM_TIMEOUT_S"),
+        }
+    }
+
+    /// Kill criterion 1: an unset environment behaves EXACTLY as before this change.
+    /// This is the whole safety argument for shipping it as a pure refactor.
+    #[test]
+    fn unset_is_the_previous_constant() {
+        with_env(None, || {
+            assert_eq!(call_timeout(), std::time::Duration::from_secs(300));
+        });
+    }
+
+    #[test]
+    fn a_valid_value_is_honoured() {
+        with_env(Some("900"), || {
+            assert_eq!(call_timeout(), std::time::Duration::from_secs(900));
+        });
+        with_env(Some("  120  "), || {
+            assert_eq!(call_timeout(), std::time::Duration::from_secs(120));
+        });
+    }
+
+    /// The DIRECTION matters more than the rule. Every malformed value falls back to the default,
+    /// never to something smaller: a typo that shortened the timeout would convert a working lane
+    /// into one that fails closed, silently -- exactly the failure this knob exists to let an
+    /// operator fix.
+    #[test]
+    fn every_malformed_value_falls_back_to_the_default_never_to_something_shorter() {
+        for bad in ["", "   ", "abc", "-5", "0", "12.5", "300s", "99999999", "1e3"] {
+            with_env(Some(bad), || {
+                assert_eq!(
+                    call_timeout(),
+                    std::time::Duration::from_secs(300),
+                    "malformed value {bad:?} must fall back to the default"
+                );
+            });
+        }
+    }
+
+    /// A day is the ceiling; beyond it is a typo, not a policy.
+    #[test]
+    fn the_upper_bound_is_a_day() {
+        with_env(Some("86400"), || {
+            assert_eq!(call_timeout(), std::time::Duration::from_secs(86_400));
+        });
+        with_env(Some("86401"), || {
+            assert_eq!(call_timeout(), std::time::Duration::from_secs(300));
+        });
+    }
+
+    /// Kill criterion 4: ALL THREE sites use the knob. A knob wired to two of three would be
+    /// invisible -- the patched paths would obey it and the third would keep the old constant.
+    /// Asked of the source, because "the function exists" says nothing about who calls it.
+    #[test]
+    fn every_timeout_site_uses_the_knob() {
+        // Count only the REAL code. `include_str!` pulls in this test module too, and the
+        // assertion string below is itself a literal match -- the search finding itself, which is
+        // the same trap as `pgrep -f` matching its own shell. Cut at the test module first.
+        let whole = include_str!("api.rs");
+        let src = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+        assert_eq!(
+            src.matches(".timeout_global(Some(call_timeout()))").count(),
+            3,
+            "all three timeout sites must use call_timeout()"
+        );
+        assert_eq!(
+            src.matches(".timeout_global(Some(std::time::Duration::from_secs(")
+                .count(),
+            0,
+            "no timeout site may still hardcode a duration"
+        );
     }
 }
