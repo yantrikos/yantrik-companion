@@ -142,8 +142,8 @@ impl ApiLLM {
         // thinking could not be turned on for those families by any means. GenerationConfig.think
         // existed, the YM_THINK_* env knobs resolved to Some(true) correctly, and none of it
         // survived this function.
-        match crate::think_policy::think_for_model(&self.model, config.think) {
-            Some(t) => body["think"] = serde_json::json!(t),
+        match crate::think_policy::think_setting_for_model(&self.model, config.think) {
+            Some(setting) => body["think"] = setting.native_json(),
             None if self.template().disable_thinking() => body["think"] = serde_json::json!(false),
             None => {}
         }

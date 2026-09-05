@@ -295,6 +295,10 @@ pub struct ModelCapabilityProfile {
     /// `YM_LLM_TIMEOUT_S` says otherwise. `None` = the compiled default (300 s). Measured: a 27B
     /// thinking model authored a project in 312 s on the local lane, past the 300 s default.
     pub call_timeout_s: Option<u64>,
+    /// E.THINKLVL1: the measured thinking LEVEL for this model when nothing else decides.
+    /// `Low` for gpt-oss (7.5 s and files every run at n=5) and for qwen 3.x (the same three
+    /// files every run where the plain switch is erratic). `None` = unmeasured.
+    pub think_level_default: Option<crate::think_policy::ThinkLevel>,
 }
 
 impl ModelCapabilityProfile {
@@ -346,6 +350,11 @@ impl ModelCapabilityProfile {
         // that mode exists because a small model is overwhelmed by many tools at once, and a
         // family flag says nothing about capacity. (This override is a local addition; upstream
         // has none, and it silently broke the tier rule for every small Qwen.)
+        // E.THINKLVL1: measured level defaults, by model name, never by a broad family (the
+        // OpenAI family also covers real OpenAI models, which were not measured).
+        if lower.contains("gpt-oss") || lower.contains("qwen3") {
+            profile.think_level_default = Some(crate::think_policy::ThinkLevel::Low);
+        }
         if profile.family.supports_native_tools()
             && matches!(tier, ModelTier::Medium | ModelTier::Large)
         {
@@ -387,6 +396,7 @@ impl ModelCapabilityProfile {
             hallucination_firewall: true,
             think_default: None,
             call_timeout_s: None,
+            think_level_default: None,
         }
     }
 
@@ -421,6 +431,7 @@ impl ModelCapabilityProfile {
             hallucination_firewall: true,
             think_default: None,
             call_timeout_s: None,
+            think_level_default: None,
         }
     }
 
@@ -455,6 +466,7 @@ impl ModelCapabilityProfile {
             hallucination_firewall: true,
             think_default: None,
             call_timeout_s: None,
+            think_level_default: None,
         }
     }
 
@@ -489,6 +501,7 @@ impl ModelCapabilityProfile {
             hallucination_firewall: true,
             think_default: None,
             call_timeout_s: None,
+            think_level_default: None,
         }
     }
 
@@ -562,6 +575,7 @@ impl ModelCapabilityProfile {
             hallucination_firewall: params < 14.0,
             think_default: None,
             call_timeout_s: None,
+            think_level_default: None,
         }
     }
 
@@ -596,6 +610,7 @@ impl ModelCapabilityProfile {
             hallucination_firewall: false, // large models hallucinate less
             think_default: None,
             call_timeout_s: Some(600),
+            think_level_default: None,
         }
     }
 

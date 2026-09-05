@@ -274,8 +274,8 @@ impl GenericOpenAIBackend {
         // Per-call think override (config.think) wins over the provider preset — Ollama honors
         // `think` in the request body, which is what enables dual-mode from a single model tag:
         // OFF for tool-selection dispatch, ON for reasoning/compose. None => preset default.
-        match crate::think_policy::think_for_model(&self.model, config.think) {
-            Some(t) => body["think"] = serde_json::json!(t),
+        match crate::think_policy::think_setting_for_model(&self.model, config.think) {
+            Some(setting) => body["think"] = setting.native_json(),
             None if self.presets.disable_thinking => body["think"] = serde_json::json!(false),
             None => {}
         }
@@ -452,9 +452,13 @@ impl GenericOpenAIBackend {
 
         // Per-call think override wins over the preset (see build_ollama_body). On the OpenAI-compat
         // path Ollama ignores `think`, so also emit reasoning_effort:"none" when forcing OFF.
-        match crate::think_policy::think_for_model(&self.model, config.think) {
-            Some(true) => { body["think"] = serde_json::json!(true); }
-            Some(false) => { body["think"] = serde_json::json!(false); body["reasoning_effort"] = serde_json::json!("none"); }
+        match crate::think_policy::think_setting_for_model(&self.model, config.think) {
+            Some(setting) => {
+                body["think"] = setting.native_json();
+                if let Some(effort) = setting.reasoning_effort() {
+                    body["reasoning_effort"] = serde_json::json!(effort);
+                }
+            }
             None if self.presets.disable_thinking => { body["think"] = serde_json::json!(false); body["reasoning_effort"] = serde_json::json!("none"); }
             None => {}
         }
@@ -690,6 +694,12 @@ mod think_body_tests {
     use super::*;
     use crate::types::{ChatMessage, GenerationConfig};
 
+    /// The tests below mutate one process-wide env var; they must not interleave.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn bodies(cfg_think: Option<bool>) -> (serde_json::Value, serde_json::Value) {
         let b = GenericOpenAIBackend::for_provider("ollama", "http://127.0.0.1:11434", None, "qwen3.8:27b-q4_K_M");
         let msgs = vec![ChatMessage::user("hi")];
@@ -697,9 +707,31 @@ mod think_body_tests {
         (b.build_ollama_body(&msgs, &cfg, None, false), b.build_openai_body(&msgs, &cfg, None, false))
     }
 
+    /// E.THINKLVL1: a level is written as the measured wire words on both paths.
+    #[test]
+    fn a_per_model_level_reaches_both_bodies_as_the_measured_wire_words() {
+        let _env = env_guard();
+        std::env::set_var("YM_THINK_MODELS", "qwen3.8=low");
+        let (native, openai) = bodies(Some(false));
+        std::env::remove_var("YM_THINK_MODELS");
+        assert_eq!(native["think"], serde_json::json!("low"), "{native}");
+        assert_eq!(openai["reasoning_effort"], serde_json::json!("low"), "{openai}");
+        assert_eq!(openai["think"], serde_json::json!("low"), "{openai}");
+    }
+
+    /// E.THINKLVL1: the profile's measured default applies when nothing else decides.
+    #[test]
+    fn the_measured_family_default_is_low_when_nothing_else_decides() {
+        let _env = env_guard();
+        std::env::remove_var("YM_THINK_MODELS");
+        let (native, _) = bodies(None);
+        assert_eq!(native["think"], serde_json::json!("low"), "qwen3.8 profile default: {native}");
+    }
+
     /// E.THINKOBS1: the request body is the last code before the wire, so it is the observable.
     #[test]
     fn a_per_model_entry_reaches_both_request_bodies_and_beats_the_caller() {
+        let _env = env_guard();
         std::env::set_var("YM_THINK_MODELS", "qwen3.8=off");
         let (native, openai) = bodies(Some(true));
         std::env::remove_var("YM_THINK_MODELS");
