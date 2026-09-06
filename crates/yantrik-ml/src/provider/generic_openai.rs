@@ -372,6 +372,7 @@ impl GenericOpenAIBackend {
         let mut full_text = String::new();
         let mut stop_reason = "stop".to_string();
         let mut eval_count = 0usize;
+        let mut prompt_eval_count = 0usize;
         let mut api_tool_calls = Vec::new();
 
         for line_result in reader.lines() {
@@ -395,6 +396,8 @@ impl GenericOpenAIBackend {
 
             if chunk["done"].as_bool() == Some(true) {
                 eval_count = chunk["eval_count"].as_u64().unwrap_or(0) as usize;
+                // E.USAGE1: the final chunk carries the prompt count too, and it was discarded.
+                prompt_eval_count = chunk["prompt_eval_count"].as_u64().unwrap_or(0) as usize;
                 if chunk["done_reason"].as_str() == Some("length") {
                     stop_reason = "length".to_string();
                 }
@@ -410,7 +413,7 @@ impl GenericOpenAIBackend {
         Ok(LLMResponse {
             thinking: String::new(),
             text: full_text,
-            prompt_tokens: 0,
+            prompt_tokens: prompt_eval_count,
             completion_tokens: eval_count,
             tool_calls,
             api_tool_calls,
@@ -439,6 +442,17 @@ impl GenericOpenAIBackend {
             "temperature": config.temperature,
             "stream": stream,
         });
+
+        // E.USAGE1: an OpenAI-compatible server sends NO usage record on a stream unless it is
+        // asked. Without this every streamed generation was accounted as zero tokens -- in the
+        // mind's own spend log, in the benchmark's receipt, and to the rate learner that sizes a
+        // clamped authoring budget. Measured against the local model on 2026-09-06: streaming
+        // without the option returns no usage, with it returns the same counts the non-streaming
+        // call reports. `YM_STREAM_USAGE=0` withdraws it for a provider that rejects the field,
+        // without a rebuild.
+        if stream && std::env::var("YM_STREAM_USAGE").map(|v| v.trim() != "0").unwrap_or(true) {
+            body["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
 
         if let Some(p) = config.top_p {
             body["top_p"] = serde_json::json!(p);
@@ -539,8 +553,21 @@ impl GenericOpenAIBackend {
         let body = self.build_openai_body(messages, config, tools, true);
         let resp_body = self.send_openai_request(&body)?;
 
-        let reader = BufReader::new(resp_body.into_reader());
+        Self::parse_openai_stream(BufReader::new(resp_body.into_reader()), on_token)
+    }
+
+    /// The SSE loop as a function over any reader, so a RECORDED transcript can drive it.
+    ///
+    /// E.USAGE1: it reported `prompt_tokens: 0, completion_tokens: 0` for every streamed
+    /// generation, which is why four readings could compare the mind's model REQUESTS but not its
+    /// tokens, and why the rate learner never saw a sample from this path.
+    pub(crate) fn parse_openai_stream<R: std::io::BufRead>(
+        reader: R,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<LLMResponse> {
         let mut full_text = String::new();
+        let mut prompt_tokens = 0usize;
+        let mut completion_tokens = 0usize;
         let mut stop_reason = "stop".to_string();
         let mut tc_ids: HashMap<usize, String> = HashMap::new();
         let mut tc_names: HashMap<usize, String> = HashMap::new();
@@ -558,6 +585,17 @@ impl GenericOpenAIBackend {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+
+            // E.USAGE1: the usage record arrives in its OWN final chunk, whose `choices` array is
+            // EMPTY -- so it must be read here, before anything reaches for `choices[0]`.
+            if chunk["usage"].is_object() {
+                if let Some(n) = chunk["usage"]["prompt_tokens"].as_u64() {
+                    prompt_tokens = n as usize;
+                }
+                if let Some(n) = chunk["usage"]["completion_tokens"].as_u64() {
+                    completion_tokens = n as usize;
+                }
+            }
 
             let delta = &chunk["choices"][0]["delta"];
 
@@ -612,8 +650,8 @@ impl GenericOpenAIBackend {
         Ok(LLMResponse {
             thinking: String::new(),
             text: full_text,
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            prompt_tokens,
+            completion_tokens,
             tool_calls,
             api_tool_calls,
             stop_reason,
@@ -740,5 +778,78 @@ mod think_body_tests {
         assert_eq!(openai["reasoning_effort"], serde_json::json!("none"), "{openai}");
         let (native2, _) = bodies(Some(true));
         assert_eq!(native2["think"], serde_json::json!(true), "without the entry the caller's request stands: {native2}");
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use crate::types::{ChatMessage, GenerationConfig};
+
+    fn backend() -> GenericOpenAIBackend {
+        GenericOpenAIBackend::for_provider(
+            "ollama",
+            "http://127.0.0.1:11434",
+            None,
+            "gpt-oss-backup:20b",
+        )
+    }
+
+    /// The transcript the local model actually sent on 2026-09-06 when asked for usage: the record
+    /// arrives in its own final chunk, whose `choices` array is EMPTY. Four readings could compare
+    /// the mind's model requests but not its tokens because this was thrown away.
+    #[test]
+    fn the_recorded_local_stream_reports_the_counts_the_server_sent() {
+        let sse = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/stream/oss20_usage.sse"
+        ))
+        .expect("fixture present");
+        let mut seen = String::new();
+        let r = GenericOpenAIBackend::parse_openai_stream(
+            std::io::BufReader::new(&sse[..]),
+            &mut |t| seen.push_str(t),
+        )
+        .expect("the transcript parses");
+        assert_eq!(r.prompt_tokens, 76, "the prompt count the server reported");
+        assert_eq!(r.completion_tokens, 40, "the completion count the server reported");
+        assert_eq!(r.stop_reason, "length", "the finish reason still comes from its own chunk");
+    }
+
+    /// A server that sends no usage record is unchanged: zero, and nothing invented.
+    #[test]
+    fn a_stream_without_a_usage_record_parses_and_claims_nothing() {
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\
+                   data: [DONE]\n";
+        let mut seen = String::new();
+        let r = GenericOpenAIBackend::parse_openai_stream(
+            std::io::BufReader::new(sse.as_bytes()),
+            &mut |t| seen.push_str(t),
+        )
+        .expect("parses");
+        assert_eq!(seen, "hi", "the text still streams");
+        assert_eq!((r.prompt_tokens, r.completion_tokens), (0, 0));
+        assert_eq!(r.stop_reason, "stop");
+    }
+
+    /// The ask itself. Measured against the local model: streaming WITHOUT this option returns no
+    /// usage at all, so the counts above can only exist because the body requested them.
+    #[test]
+    fn a_streaming_body_asks_for_the_usage_record_and_a_blocking_one_does_not() {
+        let b = backend();
+        let msgs = vec![ChatMessage::user("hi")];
+        let cfg = GenerationConfig::default();
+        let streaming = b.build_openai_body(&msgs, &cfg, None, true);
+        assert_eq!(
+            streaming["stream_options"]["include_usage"],
+            serde_json::json!(true),
+            "a stream must ask, or the server sends nothing"
+        );
+        let blocking = b.build_openai_body(&msgs, &cfg, None, false);
+        assert!(
+            blocking.get("stream_options").is_none(),
+            "a blocking call already gets usage and must not carry a streaming-only field"
+        );
     }
 }
