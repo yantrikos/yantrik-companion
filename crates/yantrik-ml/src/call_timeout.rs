@@ -27,8 +27,40 @@ pub fn resolve_timeout_secs(
         .unwrap_or(DEFAULT_SECS)
 }
 
-/// The timeout for a call to `model`: the per-model env, the global env, the profile, 300 s.
-pub fn call_timeout_for(model: &str) -> std::time::Duration {
+thread_local! {
+    /// E.ARENA1-F9: the most any ONE request on this thread may wait, set by whoever knows how much
+    /// time the work it serves has left. A client's own timeout is sized for the slowest thing
+    /// that model does (a 27B lane authoring a project: 312 s), and an agent step inside a 180 s
+    /// turn inherited it: Reading C lost a turn to one request that hung 300 s, when the fallback
+    /// after it answered in one second.
+    static CALL_CAP: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the cap that was in force before [`install_call_cap`], when dropped.
+pub struct CallCapGuard(Option<std::time::Duration>);
+
+impl Drop for CallCapGuard {
+    fn drop(&mut self) {
+        CALL_CAP.with(|c| c.set(self.0));
+    }
+}
+
+/// Cap every model request made on this thread until the guard drops. `None` removes nothing —
+/// it installs "no cap" for the guard's lifetime, which is what a pooled blocking thread needs so
+/// a cap left by an earlier job cannot leak into this one.
+pub fn install_call_cap(cap: Option<std::time::Duration>) -> CallCapGuard {
+    CallCapGuard(CALL_CAP.with(|c| c.replace(cap)))
+}
+
+/// A request timeout, lowered to the thread's cap when one is installed. Never raised.
+pub fn capped(timeout: std::time::Duration) -> std::time::Duration {
+    match CALL_CAP.with(|c| c.get()) {
+        Some(cap) => timeout.min(cap),
+        None => timeout,
+    }
+}
+
+fn configured_for(model: &str) -> std::time::Duration {
     let profile = crate::capability::ModelCapabilityProfile::from_model_name(model).call_timeout_s;
     std::time::Duration::from_secs(resolve_timeout_secs(
         model,
@@ -38,14 +70,20 @@ pub fn call_timeout_for(model: &str) -> std::time::Duration {
     ))
 }
 
+/// The timeout for a call to `model`: the per-model env, the global env, the profile, 300 s —
+/// lowered to the thread's cap when the work this request serves has less time than that.
+pub fn call_timeout_for(model: &str) -> std::time::Duration {
+    capped(configured_for(model))
+}
+
 /// The model-less timeout: `YM_LLM_TIMEOUT_S`, else 300 s. For callers that have no model name.
 pub fn call_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(resolve_timeout_secs(
+    capped(std::time::Duration::from_secs(resolve_timeout_secs(
         "",
         None,
         std::env::var("YM_LLM_TIMEOUT_S").ok().as_deref(),
         None,
-    ))
+    )))
 }
 
 /// The sentence a client writes when ITS call timed out: the seconds it actually waited and the
@@ -56,13 +94,24 @@ pub fn timeout_sentence(model: &str, secs: u64) -> String {
     format!("timed out after {secs} s waiting for {model} (YM_LLM_TIMEOUT_MODELS / YM_LLM_TIMEOUT_S)")
 }
 
+/// The sentence when the CAP, not the model's own timeout, ended the wait — naming the knobs would
+/// send someone to change a setting that did not decide it.
+pub fn capped_sentence(model: &str, secs: u64) -> String {
+    format!("gave up after {secs} s waiting for {model}: the work it served had no more time to give this request")
+}
+
 /// Turn a transport error into the error the caller sees: a ureq timeout becomes the sentence
 /// above; anything else passes through unchanged.
 #[cfg(feature = "api-llm")]
 pub fn describe_send_error(model: &str, e: ureq::Error) -> anyhow::Error {
     match e {
         ureq::Error::Timeout(_) => {
-            anyhow::anyhow!("{}", timeout_sentence(model, call_timeout_for(model).as_secs()))
+            let waited = call_timeout_for(model);
+            if waited < configured_for(model) {
+                anyhow::anyhow!("{}", capped_sentence(model, waited.as_secs()))
+            } else {
+                anyhow::anyhow!("{}", timeout_sentence(model, waited.as_secs()))
+            }
         }
         other => anyhow::Error::from(other),
     }
@@ -87,6 +136,38 @@ mod tests {
         assert!(text.contains("timed out after ") && text.contains("qwen3.8:27b"), "{text}");
         let other = describe_send_error("m", ureq::Error::HostNotFound);
         assert!(!format!("{other:#}").contains("timed out after"), "{other:#}");
+    }
+
+    /// E.ARENA1-F9: the cap lowers a request's timeout for as long as its guard lives, never
+    /// raises one, and leaves the thread as it found it — a pooled blocking thread runs many jobs.
+    #[test]
+    fn a_call_cap_lowers_the_timeout_only_while_installed() {
+        use std::time::Duration as D;
+        let m = "qwen3.8:27b-q4_K_M"; // Large profile: 600 s, when no env says otherwise
+        let uncapped = call_timeout_for(m);
+        {
+            let _g = install_call_cap(Some(D::from_secs(63)));
+            assert_eq!(call_timeout_for(m), D::from_secs(63).min(uncapped));
+            assert_eq!(call_timeout(), D::from_secs(63).min(call_timeout()));
+            {
+                let _inner = install_call_cap(None);
+                assert_eq!(call_timeout_for(m), uncapped, "an inner job with no cap is not capped");
+            }
+            assert_eq!(call_timeout_for(m), D::from_secs(63).min(uncapped), "the outer cap is back");
+        }
+        assert_eq!(call_timeout_for(m), uncapped, "dropped: the thread is as it was");
+        let _big = install_call_cap(Some(D::from_secs(86_400)));
+        assert_eq!(call_timeout_for(m), uncapped, "a cap never raises a timeout");
+    }
+
+    #[cfg(feature = "api-llm")]
+    #[test]
+    fn a_capped_timeout_says_the_cap_ended_it_not_a_setting() {
+        let m = "qwen3.8:27b-q4_K_M";
+        let _g = install_call_cap(Some(std::time::Duration::from_secs(7)));
+        let text = format!("{:#}", describe_send_error(m, ureq::Error::Timeout(ureq::Timeout::Global)));
+        assert!(text.contains("gave up after 7 s") && text.contains(m), "{text}");
+        assert!(!text.contains("YM_LLM_TIMEOUT"), "the knobs did not decide it: {text}");
     }
 
     #[test]
@@ -129,7 +210,12 @@ mod tests {
     /// model-less `call_timeout()` is no longer acceptable at a client site either.
     #[test]
     fn every_timeout_site_in_every_client_uses_the_model_aware_knob() {
-        for file in ["src/llm/api.rs", "src/provider/generic_openai.rs"] {
+        for file in [
+            "src/llm/api.rs",
+            "src/provider/generic_openai.rs",
+            "src/provider/anthropic.rs",
+            "src/provider/gemini.rs",
+        ] {
             let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/").to_string() + file).unwrap();
             let src = src.split("#[cfg(test)]").next().unwrap_or("");
             let literal = src.matches(".timeout_global(Some(std::time::Duration::from_secs(").count();
