@@ -309,7 +309,9 @@ impl GenericOpenAIBackend {
                 e
             })
             .map_err(|e| crate::call_timeout::describe_send_error(&self.model, e))
-            .context("Ollama API request failed")?;
+            .with_context(|| {
+                format!("Ollama API request to {} failed", crate::call_timeout::shown_endpoint(&url))
+            })?;
 
         Ok(resp.into_body())
     }
@@ -503,7 +505,12 @@ impl GenericOpenAIBackend {
         let resp = req
             .send(body_str.as_bytes())
             .map_err(|e| crate::call_timeout::describe_send_error(&self.model, e))
-            .context("OpenAI-compatible API request failed")?;
+            .with_context(|| {
+                format!(
+                    "OpenAI-compatible API request to {} failed",
+                    crate::call_timeout::shown_endpoint(&url)
+                )
+            })?;
 
         Ok(resp.into_body())
     }
@@ -778,6 +785,32 @@ mod think_body_tests {
         assert_eq!(openai["reasoning_effort"], serde_json::json!("none"), "{openai}");
         let (native2, _) = bodies(Some(true));
         assert_eq!(native2["think"], serde_json::json!(true), "without the entry the caller's request stands: {native2}");
+    }
+}
+
+/// E.MSG3: a refused connection names the address it was refused at, and the cause.
+#[cfg(test)]
+mod endpoint_in_error_tests {
+    use super::*;
+    use crate::traits::LLMBackend;
+    use crate::types::{ChatMessage, GenerationConfig};
+
+    #[test]
+    fn a_refused_connection_names_where_it_went() {
+        // A port that was just free: bound, read, released.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let be = GenericOpenAIBackend::for_provider(
+            "openrouter",
+            format!("http://127.0.0.1:{port}/v1"),
+            Some("k".into()),
+            "m",
+        );
+        let e = be
+            .chat(&[ChatMessage::user("hi")], &GenerationConfig::default(), None)
+            .expect_err("nothing is listening");
+        let text = format!("{e:#}");
+        assert!(text.contains(&format!("127.0.0.1:{port}")), "the address is missing: {text}");
+        assert!(text.split(" failed").nth(1).is_some_and(|c| !c.trim().is_empty()), "the cause is missing: {text}");
     }
 }
 

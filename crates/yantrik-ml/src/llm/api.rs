@@ -197,7 +197,9 @@ impl ApiLLM {
                 e
             })
             .map_err(|e| crate::call_timeout::describe_send_error(&self.model, e))
-            .context("Ollama API request failed")?;
+            .with_context(|| {
+                format!("Ollama API request to {} failed", crate::call_timeout::shown_endpoint(&url))
+            })?;
 
         let status = resp.status();
         if status != 200 {
@@ -210,7 +212,11 @@ impl ApiLLM {
                 error_response = %preview,
                 "Ollama API returned error"
             );
-            anyhow::bail!("Ollama API request failed: http status: {}", status.as_u16());
+            anyhow::bail!(
+                "Ollama API request to {} failed: http status: {}",
+                crate::call_timeout::shown_endpoint(&url),
+                status.as_u16()
+            );
         }
 
         Ok(resp.into_body())

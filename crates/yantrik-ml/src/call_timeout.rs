@@ -86,6 +86,26 @@ pub fn call_timeout() -> std::time::Duration {
     )))
 }
 
+/// E.MSG3: the address a failed request went to, as it may be shown to a person -- scheme, host,
+/// port and path, never a `user:pass@` or a query string, where a configured URL can carry
+/// credentials. yantrik-os #166: every turn read "OpenAI-compatible API request failed", naming
+/// neither the address (a dead local proxy at 127.0.0.1:7461) nor the cause, and the first
+/// diagnosis blamed the privacy lane.
+pub fn shown_endpoint(url: &str) -> String {
+    let bare = url.split(['?', '#']).next().unwrap_or("");
+    match bare.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = match rest.find('/') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, ""),
+            };
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            format!("{scheme}://{host}{path}")
+        }
+        None => bare.rsplit_once('@').map_or(bare, |(_, h)| h).to_string(),
+    }
+}
+
 /// The sentence a client writes when ITS call timed out: the seconds it actually waited and the
 /// model it waited for (E.MSG2). One source of truth, at the site that knows both — the lane
 /// above relays it instead of guessing from a model-less knob (which said "300 s" for a 5 s
@@ -168,6 +188,19 @@ mod tests {
         let text = format!("{:#}", describe_send_error(m, ureq::Error::Timeout(ureq::Timeout::Global)));
         assert!(text.contains("gave up after 7 s") && text.contains(m), "{text}");
         assert!(!text.contains("YM_LLM_TIMEOUT"), "the knobs did not decide it: {text}");
+    }
+
+    #[test]
+    fn a_shown_endpoint_never_carries_credentials_or_a_query() {
+        assert_eq!(
+            shown_endpoint("https://user:s3cret@api.example.com/v1/chat/completions?key=abc#x"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            shown_endpoint("http://127.0.0.1:7461/v1/chat/completions"),
+            "http://127.0.0.1:7461/v1/chat/completions"
+        );
+        assert_eq!(shown_endpoint("http://token@10.0.0.2:11434"), "http://10.0.0.2:11434");
     }
 
     #[test]
