@@ -232,7 +232,9 @@ impl GoogleGeminiBackend {
     fn send_request(&self, url: &str, body: &serde_json::Value) -> Result<ureq::Body> {
         let body_str = serde_json::to_string(body)?;
 
-        tracing::debug!(body_bytes = body_str.len(), url = %url, "Gemini request");
+        // The key rides in this URL's query (`?key=`). Log the endpoint, never the key: a mind's
+        // log is readable by more than the mind once minds share an account (yantrik-os #435).
+        tracing::debug!(body_bytes = body_str.len(), url = %crate::call_timeout::shown_endpoint(url), "Gemini request");
 
         let agent = self.build_agent();
         let resp = agent.post(url)
