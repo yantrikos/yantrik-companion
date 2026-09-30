@@ -926,7 +926,22 @@ mod auth_header_tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
+            // A deadline on every wait, so a client that never connects or stalls fails the test
+            // instead of hanging it.
+            let limit = std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + limit;
+            listener.set_nonblocking(true).unwrap();
+            let mut conn = loop {
+                match listener.accept() {
+                    Ok((conn, _)) => break conn,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("no request reached the listener within {limit:?}: {e}"),
+                }
+            };
+            conn.set_nonblocking(false).unwrap();
+            conn.set_read_timeout(Some(limit)).unwrap();
             let mut got = Vec::new();
             let mut buf = [0u8; 4096];
             let head_end = loop {
