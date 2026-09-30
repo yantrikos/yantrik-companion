@@ -915,7 +915,7 @@ impl CompanionService {
             let backend = yantrik_ml::ProviderRegistry::create_backend(
                 &provider_cfg.provider_type,
                 &provider_cfg.base_url,
-                provider_cfg.api_key.as_deref(),
+                provider_cfg.key_to_send(),
                 model,
             );
 
