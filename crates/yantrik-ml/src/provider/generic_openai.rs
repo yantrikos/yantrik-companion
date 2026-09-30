@@ -72,8 +72,8 @@ pub struct GenericOpenAIBackend {
     api_key: Option<String>,
     /// Model name (e.g. "gpt-4o", "qwen3.5:27b-nothink").
     model: String,
-    /// Auth header style: "bearer" sends `Authorization: Bearer <key>`,
-    /// "none" sends no auth header.
+    /// Auth header style: "bearer" sends `Authorization: Bearer <key>` when a key is set,
+    /// "none" never sends one.
     auth_style: String,
     /// Provider-specific behavior presets.
     presets: ProviderPresets,
@@ -126,11 +126,10 @@ impl GenericOpenAIBackend {
             "openrouter" => ProviderPresets::openrouter(),
             _ => ProviderPresets::default(),
         };
-        let auth_style = match provider_type {
-            "ollama" => "none",
-            _ => "bearer",
-        };
-        Self::new(base_url, api_key, model, auth_style, presets)
+        // Every provider sends the key it was given for this address, and none without one. Ollama
+        // itself takes no key, but one behind an authenticating proxy (a gateway, a sealed gate)
+        // needs it, and a key is only ever set for the address it belongs to.
+        Self::new(base_url, api_key, model, "bearer", presets)
     }
 
     /// Per-workload thinking control (builder). `true` lets the model reason (higher quality,
@@ -216,7 +215,7 @@ impl GenericOpenAIBackend {
     /// Build auth and extra headers as a vec of (key, value) pairs.
     fn auth_headers(&self) -> Vec<(String, String)> {
         let mut headers = Vec::new();
-        if let Some(ref key) = self.api_key {
+        if let Some(key) = self.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
             if self.auth_style != "none" {
                 headers.push(("Authorization".to_string(), format!("Bearer {key}")));
             }
@@ -883,6 +882,99 @@ mod usage_tests {
         assert!(
             blocking.get("stream_options").is_none(),
             "a blocking call already gets usage and must not carry a streaming-only field"
+        );
+    }
+}
+
+#[cfg(test)]
+mod auth_header_tests {
+    use super::GenericOpenAIBackend;
+
+    fn authorization(b: &GenericOpenAIBackend) -> Option<String> {
+        b.auth_headers().into_iter().find(|(k, _)| k == "Authorization").map(|(_, v)| v)
+    }
+
+    #[test]
+    fn an_ollama_behind_a_gate_is_sent_the_key_it_was_given() {
+        let gated = GenericOpenAIBackend::for_provider("ollama", "http://10.99.0.1:8443", Some("k".into()), "m");
+        assert_eq!(authorization(&gated).as_deref(), Some("Bearer k"));
+    }
+
+    #[test]
+    fn no_key_or_a_blank_one_sends_no_header() {
+        for key in [None, Some(String::new()), Some("  ".to_string())] {
+            for provider in ["ollama", "openai", "nvidia-nim"] {
+                let b = GenericOpenAIBackend::for_provider(provider, "http://localhost:11434/v1", key.clone(), "m");
+                assert_eq!(authorization(&b), None, "{provider} {key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn auth_style_none_never_sends_a_key() {
+        let b = GenericOpenAIBackend::new("http://x/v1", Some("k".into()), "m", "none", Default::default());
+        assert_eq!(authorization(&b), None);
+    }
+
+    /// The request head an Ollama backend with `key` actually puts on the wire, read by a
+    /// listener standing in for the server.
+    fn request_head_sent(key: Option<&str>) -> String {
+        use crate::traits::LLMBackend;
+        use crate::types::{ChatMessage, GenerationConfig};
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            let head_end = loop {
+                let n = conn.read(&mut buf).unwrap();
+                assert!(n > 0, "the client hung up before sending a request");
+                got.extend_from_slice(&buf[..n]);
+                if let Some(i) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i;
+                }
+            };
+            let head = String::from_utf8_lossy(&got[..head_end]).to_string();
+            let body_len = head
+                .lines()
+                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                .unwrap_or(0);
+            while got.len() < head_end + 4 + body_len {
+                let n = conn.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            let reply = r#"{"model":"m","message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}"#;
+            write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .unwrap();
+            head
+        });
+        let be = GenericOpenAIBackend::for_provider("ollama", format!("http://127.0.0.1:{port}"), key.map(String::from), "m");
+        // Only the request matters here; the reply is whatever the server stand-in could say.
+        let _ = be.chat(&[ChatMessage::user("hi")], &GenerationConfig::default(), None);
+        server.join().unwrap()
+    }
+
+    #[test]
+    fn on_the_wire_a_plain_ollama_sees_no_authorization_and_a_gated_one_sees_its_key() {
+        for key in [None, Some(""), Some("  ")] {
+            let head = request_head_sent(key).to_ascii_lowercase();
+            assert!(head.starts_with("post /api/chat "), "{head}");
+            assert!(!head.contains("\nauthorization:"), "{key:?} sent an Authorization header:\n{head}");
+        }
+        let head = request_head_sent(Some("gate-key"));
+        assert!(
+            head.lines().any(|l| l.eq_ignore_ascii_case("authorization: Bearer gate-key")),
+            "the gated request carries its key:\n{head}"
         );
     }
 }
