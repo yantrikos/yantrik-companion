@@ -369,14 +369,26 @@ impl GenericOpenAIBackend {
         let body = self.build_ollama_body(messages, config, tools, true);
         let resp_body = self.send_ollama_request(&body)?;
 
-        let reader = BufReader::new(resp_body.into_reader());
+        Self::parse_ollama_stream(BufReader::new(resp_body.into_reader()), on_token)
+    }
+
+    /// The Ollama stream loop as a function over any reader, so a transcript can drive it.
+    pub(crate) fn parse_ollama_stream<R: std::io::BufRead>(
+        reader: R,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<LLMResponse> {
         let mut full_text = String::new();
+        // E.VOICE2 (Yantrik Mind): the reasoning arrives in its own `thinking` field, as on the
+        // plain path (`ollama_chat`), which keeps it; the stream used to drop it.
+        let mut thinking = String::new();
         let mut stop_reason = "stop".to_string();
         let mut eval_count = 0usize;
         let mut prompt_eval_count = 0usize;
         let mut api_tool_calls = Vec::new();
 
         for line_result in reader.lines() {
+            // E.VOICE2: a cancelled request stops reading here; dropping the body closes it.
+            crate::call_cancel::check()?;
             let line: String = line_result.context("reading Ollama stream line")?;
             if line.trim().is_empty() { continue; }
 
@@ -390,6 +402,9 @@ impl GenericOpenAIBackend {
                     on_token(content);
                     full_text.push_str(content);
                 }
+            }
+            if let Some(t) = chunk["message"]["thinking"].as_str() {
+                thinking.push_str(t);
             }
 
             let tc = Self::parse_api_tool_calls(&chunk["message"]);
@@ -412,7 +427,7 @@ impl GenericOpenAIBackend {
         };
 
         Ok(LLMResponse {
-            thinking: String::new(),
+            thinking: thinking.trim().to_string(),
             text: full_text,
             prompt_tokens: prompt_eval_count,
             completion_tokens: eval_count,
@@ -580,6 +595,8 @@ impl GenericOpenAIBackend {
         let mut tc_args: HashMap<usize, String> = HashMap::new();
 
         for line_result in reader.lines() {
+            // E.VOICE2: a cancelled request stops reading here; dropping the body closes it.
+            crate::call_cancel::check()?;
             let line: String = line_result.context("reading SSE line")?;
             let data = match line.strip_prefix("data: ") {
                 Some(d) => d,
@@ -991,5 +1008,82 @@ mod auth_header_tests {
             head.lines().any(|l| l.eq_ignore_ascii_case("authorization: Bearer gate-key")),
             "the gated request carries its key:\n{head}"
         );
+    }
+}
+
+/// E.VOICE2 (Yantrik Mind): a cancelled stream stops between lines, and an unset or absent flag
+/// changes nothing.
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// A server that does not stop writing: one content chunk per line, ten thousand lines (a
+    /// bound, so a missing check fails the test instead of hanging it).
+    struct Endless(usize);
+
+    impl std::io::Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0 >= 10_000 {
+                return Ok(0);
+            }
+            self.0 += 1;
+            let line = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"w \"}}]}\n";
+            let n = line.len().min(buf.len());
+            buf[..n].copy_from_slice(&line[..n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_cancelled_stream_stops_within_one_line() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let _g = crate::call_cancel::install_cancel(Some(flag.clone()));
+        let mut tokens = 0usize;
+        let r = GenericOpenAIBackend::parse_openai_stream(std::io::BufReader::new(Endless(0)), &mut |_| {
+            tokens += 1;
+            if tokens == 3 {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+        let e = r.expect_err("the stream must end by being cancelled, not by running out");
+        assert!(format!("{e:#}").contains("cancelled"), "{e:#}");
+        assert_eq!(tokens, 3, "no line was read after the flag was set");
+    }
+
+    /// The streamed Ollama path returns what the plain one does: the reasoning from its own field,
+    /// the words, and a native tool call.
+    #[test]
+    fn the_ollama_stream_keeps_its_thinking_and_its_tool_call() {
+        let lines = [
+            r#"{"message":{"role":"assistant","content":"","thinking":"The person wants "}}"#,
+            r#"{"message":{"role":"assistant","content":"","thinking":"dinner ideas."}}"#,
+            r#"{"message":{"role":"assistant","content":"Let me look."}}"#,
+            r#"{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","function":{"name":"recall","arguments":{"query":"food"}}}]}}"#,
+            r#"{"message":{"role":"assistant","content":""},"done":true,"eval_count":9,"prompt_eval_count":40}"#,
+        ];
+        let body = lines.join("
+");
+        let mut seen = String::new();
+        let r = GenericOpenAIBackend::parse_ollama_stream(std::io::BufReader::new(body.as_bytes()), &mut |t| seen.push_str(t))
+            .expect("parses");
+        assert_eq!(r.thinking, "The person wants dinner ideas.");
+        assert_eq!((seen.as_str(), r.text.as_str()), ("Let me look.", "Let me look."));
+        assert_eq!(r.tool_calls.len(), 1, "{:?}", r.tool_calls);
+        assert_eq!(r.tool_calls[0].name, "recall");
+        assert_eq!((r.prompt_tokens, r.completion_tokens), (40, 9));
+    }
+
+    #[test]
+    fn an_installed_flag_that_is_never_set_changes_nothing() {
+        let _g = crate::call_cancel::install_cancel(Some(Arc::new(AtomicBool::new(false))));
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi \"}}]}\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"there\"}}]}\n\
+                   data: [DONE]\n";
+        let mut seen = String::new();
+        let r = GenericOpenAIBackend::parse_openai_stream(std::io::BufReader::new(sse.as_bytes()), &mut |t| seen.push_str(t))
+            .expect("parses");
+        assert_eq!((seen.as_str(), r.text.as_str()), ("hi there", "hi there"));
     }
 }
