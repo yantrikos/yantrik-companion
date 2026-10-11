@@ -35,12 +35,30 @@ pub fn cancelled() -> bool {
     CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(Ordering::SeqCst)))
 }
 
-/// The error a request returns when it was cancelled; checked between the lines of a stream.
+/// The error a cancelled request returns. TYPED, so a wrapper can tell a cancel from a failure:
+/// a cancel is not the backend's fault, and must not count against it or start a fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled: the work this request served is over")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// [`Cancelled`] when this thread's flag is set; checked between the lines of a stream.
 pub fn check() -> anyhow::Result<()> {
     if cancelled() {
-        anyhow::bail!("cancelled: the work this request served is over");
+        return Err(anyhow::Error::new(Cancelled));
     }
     Ok(())
+}
+
+/// Whether `e` is (or wraps, through any `.context`) a cancel.
+pub fn is_cancel(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Cancelled>().is_some()
 }
 
 #[cfg(test)]
@@ -56,7 +74,11 @@ mod tests {
             assert!(!cancelled());
             flag.store(true, Ordering::SeqCst);
             assert!(cancelled());
-            assert!(format!("{:#}", check().unwrap_err()).contains("cancelled"));
+            let e = check().unwrap_err();
+            assert!(format!("{e:#}").contains("cancelled"));
+            assert!(is_cancel(&e), "typed");
+            assert!(is_cancel(&e.context("reading SSE line")), "typed, through context");
+            assert!(!is_cancel(&anyhow::anyhow!("cancelled by the server")), "the word alone is not a cancel");
             {
                 let _inner = install_cancel(None);
                 assert!(!cancelled(), "an inner job with no flag is not cancelled");

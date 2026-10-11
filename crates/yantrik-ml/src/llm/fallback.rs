@@ -222,6 +222,8 @@ impl LLMBackend for FallbackLLM {
         config: &GenerationConfig,
         tools: Option<&[serde_json::Value]>,
     ) -> Result<LLMResponse> {
+        // A cancelled call starts nothing, on either backend.
+        crate::call_cancel::check()?;
         // If primary has been failing consistently, skip to fallback
         if self.should_skip_primary() {
             if let Ok(fb) = self.get_fallback() {
@@ -235,6 +237,8 @@ impl LLMBackend for FallbackLLM {
                 self.primary_success();
                 Ok(resp)
             }
+            // A cancel is not a failure: no count against the primary, no fallback request.
+            Err(e) if crate::call_cancel::is_cancel(&e) => Err(e),
             Err(primary_err) => {
                 self.primary_failure();
                 tracing::warn!(
@@ -268,6 +272,8 @@ impl LLMBackend for FallbackLLM {
         tools: Option<&[serde_json::Value]>,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<LLMResponse> {
+        // A cancelled call starts nothing, on either backend.
+        crate::call_cancel::check()?;
         if self.should_skip_primary() {
             if let Ok(fb) = self.get_fallback() {
                 tracing::debug!("Skipping primary (consecutive failures), using fallback streaming");
@@ -280,6 +286,9 @@ impl LLMBackend for FallbackLLM {
                 self.primary_success();
                 Ok(resp)
             }
+            // A cancel is not a failure: no count against the primary, and no fallback stream
+            // appending a second answer to the tokens already sent.
+            Err(e) if crate::call_cancel::is_cancel(&e) => Err(e),
             Err(primary_err) => {
                 self.primary_failure();
                 tracing::warn!(
@@ -322,5 +331,112 @@ impl LLMBackend for FallbackLLM {
 
     fn model_id(&self) -> &str {
         self.primary.model_id()
+    }
+}
+
+/// Yantrik Mind E.VOICE2 (review on yantrik-companion#2): a cancelled call is not a primary
+/// failure. It starts no fallback request, appends nothing more to the stream, and never pushes
+/// the wrapper into skipping a good primary.
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Emits one token, then reads the cancel flag the way a stream loop does (setting it first
+    /// when `cancel_mid_stream`), or fails outright when `fail`.
+    struct Counting {
+        calls: AtomicUsize,
+        cancel_mid_stream: Option<Arc<AtomicBool>>,
+        fail: bool,
+    }
+
+    impl Counting {
+        fn new(cancel_mid_stream: Option<Arc<AtomicBool>>, fail: bool) -> Arc<Self> {
+            Arc::new(Self { calls: AtomicUsize::new(0), cancel_mid_stream, fail })
+        }
+        fn run(&self, on_token: &mut dyn FnMut(&str)) -> Result<LLMResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            on_token("tok ");
+            if let Some(f) = &self.cancel_mid_stream {
+                f.store(true, Ordering::SeqCst);
+            }
+            crate::call_cancel::check()?;
+            if self.fail {
+                anyhow::bail!("connection reset");
+            }
+            Ok(LLMResponse { text: "tok".into(), ..Default::default() })
+        }
+    }
+
+    impl LLMBackend for Counting {
+        fn chat(&self, _: &[ChatMessage], _: &GenerationConfig, _: Option<&[serde_json::Value]>) -> Result<LLMResponse> {
+            self.run(&mut |_| {})
+        }
+        fn chat_streaming(&self, _: &[ChatMessage], _: &GenerationConfig, _: Option<&[serde_json::Value]>, on: &mut dyn FnMut(&str)) -> Result<LLMResponse> {
+            self.run(on)
+        }
+        fn count_tokens(&self, t: &str) -> Result<usize> {
+            Ok(t.len())
+        }
+        fn backend_name(&self) -> &str {
+            "counting"
+        }
+    }
+
+    fn msgs() -> Vec<ChatMessage> {
+        // A system prompt first, as every real caller sends: `slim_messages` slices out of range
+        // on a lone user message (pre-existing, reported on the PR).
+        vec![ChatMessage::system("be brief"), ChatMessage::user("hi")]
+    }
+
+    #[test]
+    fn a_cancel_mid_stream_starts_no_fallback_and_counts_no_failure() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let _g = crate::call_cancel::install_cancel(Some(flag.clone()));
+        let primary = Counting::new(Some(flag.clone()), false);
+        let fallback = Counting::new(None, false);
+        let llm = FallbackLLM::with_fallback(primary.clone(), fallback.clone());
+        let mut tokens = 0;
+        let e = llm.chat_streaming(&msgs(), &GenerationConfig::default(), None, &mut |_| tokens += 1).unwrap_err();
+        assert!(crate::call_cancel::is_cancel(&e), "{e:#}");
+        assert_eq!(fallback.calls.load(Ordering::SeqCst), 0, "a fallback request was sent after the cancel");
+        assert_eq!(tokens, 1, "only the primary's token reached the stream");
+        assert!(!llm.is_degraded(), "a cancel was counted as a primary failure");
+        // More calls while the flag is set start nothing, on either backend.
+        for _ in 0..3 {
+            assert!(llm.chat(&msgs(), &GenerationConfig::default(), None).is_err());
+        }
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 1, "a call started after the flag was set");
+        assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The Err arm itself, with the guard at the top of the call out of the way: the primary is
+    /// cancelled DURING the call, and a later call with a clear flag still goes to the primary.
+    #[test]
+    fn three_cancels_never_make_it_skip_the_primary() {
+        let primary = Counting::new(None, false);
+        let fallback = Counting::new(None, false);
+        let llm = FallbackLLM::with_fallback(primary.clone(), fallback.clone());
+        for _ in 0..3 {
+            let flag = Arc::new(AtomicBool::new(false));
+            let _g = crate::call_cancel::install_cancel(Some(flag.clone()));
+            let mid = Counting::new(Some(flag), false);
+            let one = FallbackLLM::with_fallback(mid, fallback.clone());
+            assert!(one.chat(&msgs(), &GenerationConfig::default(), None).is_err());
+            assert!(!one.is_degraded(), "a cancel was counted as a failure");
+        }
+        assert_eq!(fallback.calls.load(Ordering::SeqCst), 0, "a cancel fell back");
+        llm.chat(&msgs(), &GenerationConfig::default(), None).expect("the primary answers");
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_real_primary_failure_still_falls_back() {
+        let primary = Counting::new(None, true);
+        let fallback = Counting::new(None, false);
+        let llm = FallbackLLM::with_fallback(primary.clone(), fallback.clone());
+        llm.chat_streaming(&msgs(), &GenerationConfig::default(), None, &mut |_| {}).expect("the fallback answers");
+        assert_eq!(fallback.calls.load(Ordering::SeqCst), 1);
+        assert!(llm.is_degraded(), "a failure is still counted");
     }
 }
