@@ -192,8 +192,11 @@ impl FallbackLLM {
         // Last user message (always keep)
         if let Some(last) = messages.last() {
             if last.role == "user" {
-                // Keep at most 2 preceding history turns
-                let history_start = if messages.len() > 5 { messages.len() - 5 } else { 1 };
+                // Keep at most 4 preceding messages, never the system prompt pushed above.
+                // The floor is 1 only when messages[0] IS that prompt: a lone user message has
+                // nothing before it, and `1..0` panicked.
+                let first_kept = usize::from(messages[0].role == "system");
+                let history_start = messages.len().saturating_sub(5).max(first_kept);
                 for msg in &messages[history_start..messages.len() - 1] {
                     slim.push(msg.clone());
                 }
@@ -384,8 +387,6 @@ mod cancel_tests {
     }
 
     fn msgs() -> Vec<ChatMessage> {
-        // A system prompt first, as every real caller sends: `slim_messages` slices out of range
-        // on a lone user message (pre-existing, reported on the PR).
         vec![ChatMessage::system("be brief"), ChatMessage::user("hi")]
     }
 
@@ -430,6 +431,40 @@ mod cancel_tests {
         assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
     }
 
+    /// The same wrapper, cancelled mid-stream three times: the count never moves, so the fourth
+    /// call (flag clear) still goes to the primary.
+    #[test]
+    fn three_cancels_on_one_wrapper_never_skip_the_primary() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let primary = Counting::new(Some(flag.clone()), false);
+        let fallback = Counting::new(None, false);
+        let llm = FallbackLLM::with_fallback(primary.clone(), fallback.clone());
+        for _ in 0..3 {
+            flag.store(false, Ordering::SeqCst);
+            let _g = crate::call_cancel::install_cancel(Some(flag.clone()));
+            let e = llm.chat_streaming(&msgs(), &GenerationConfig::default(), None, &mut |_| {}).unwrap_err();
+            assert!(crate::call_cancel::is_cancel(&e), "{e:#}");
+            assert!(!llm.is_degraded());
+        }
+        let _none = crate::call_cancel::install_cancel(None);
+        llm.chat(&msgs(), &GenerationConfig::default(), None).expect("the primary answers");
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 4, "the primary was skipped after cancels");
+        assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Real failures still count: after three, the primary is skipped.
+    #[test]
+    fn three_real_failures_still_skip_the_primary() {
+        let primary = Counting::new(None, true);
+        let fallback = Counting::new(None, false);
+        let llm = FallbackLLM::with_fallback(primary.clone(), fallback.clone());
+        for _ in 0..4 {
+            llm.chat(&msgs(), &GenerationConfig::default(), None).expect("the fallback answers");
+        }
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 3, "the fourth call skipped the primary");
+        assert_eq!(fallback.calls.load(Ordering::SeqCst), 4);
+    }
+
     #[test]
     fn a_real_primary_failure_still_falls_back() {
         let primary = Counting::new(None, true);
@@ -438,5 +473,90 @@ mod cancel_tests {
         llm.chat_streaming(&msgs(), &GenerationConfig::default(), None, &mut |_| {}).expect("the fallback answers");
         assert_eq!(fallback.calls.load(Ordering::SeqCst), 1);
         assert!(llm.is_degraded(), "a failure is still counted");
+    }
+}
+
+/// `slim_messages` must not panic on any conversation (review on yantrik-companion#2: a lone
+/// user message sliced `1..0`).
+#[cfg(test)]
+mod slim_tests {
+    use super::*;
+
+    fn tool_result(id: &str, content: &str) -> ChatMessage {
+        ChatMessage { role: "tool".into(), content: content.into(), tool_calls: None, tool_call_id: Some(id.into()), name: Some("recall".into()) }
+    }
+
+    #[test]
+    fn empty_gives_empty() {
+        assert!(FallbackLLM::slim_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_lone_user_message_is_kept() {
+        let s = FallbackLLM::slim_messages(&[ChatMessage::user("hi")]);
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].role.as_str(), s[0].content.as_str()), ("user", "hi"));
+    }
+
+    #[test]
+    fn user_turns_with_no_system_prompt_keep_the_first_turn() {
+        let m = [ChatMessage::user("a"), ChatMessage::assistant("b"), ChatMessage::user("c")];
+        let s = FallbackLLM::slim_messages(&m);
+        assert_eq!(s.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_single_system_message_is_kept_alone() {
+        let s = FallbackLLM::slim_messages(&[ChatMessage::system("be brief")]);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].role, "system");
+    }
+
+    #[test]
+    fn a_system_prompt_and_a_user_message() {
+        let s = FallbackLLM::slim_messages(&[ChatMessage::system("sys"), ChatMessage::user("hi")]);
+        assert_eq!(s.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(), ["system", "user"]);
+    }
+
+    #[test]
+    fn a_long_history_keeps_four_messages_before_the_last() {
+        let mut m = vec![ChatMessage::system("sys")];
+        for i in 0..10 {
+            m.push(ChatMessage::user(format!("u{i}")));
+            m.push(ChatMessage::assistant(format!("a{i}")));
+        }
+        m.push(ChatMessage::user("last"));
+        let s = FallbackLLM::slim_messages(&m);
+        assert_eq!(s.len(), 6, "system + 4 history + last");
+        assert_eq!(s[0].role, "system");
+        assert_eq!(s[5].content, "last");
+    }
+
+    /// Tool messages never panic. Ending on a tool result (mid tool round) leaves only the system
+    /// prompt -- known and pre-existing; the yantrik-os copy anchors on the last user turn instead.
+    #[test]
+    fn tool_messages_do_not_panic() {
+        let s = FallbackLLM::slim_messages(&[tool_result("c1", "r")]);
+        assert!(s.is_empty());
+        let m = [ChatMessage::system("sys"), ChatMessage::user("find food"), tool_result("c1", "r")];
+        let s = FallbackLLM::slim_messages(&m);
+        assert_eq!(s.len(), 1);
+        let m = [ChatMessage::system("sys"), tool_result("c1", "r"), ChatMessage::user("and?")];
+        assert_eq!(FallbackLLM::slim_messages(&m).len(), 3);
+        let m = [tool_result("c1", "r"), ChatMessage::user("and?")];
+        assert_eq!(FallbackLLM::slim_messages(&m).len(), 2);
+    }
+
+    /// Byte 600 falls inside a multi-byte character at every offset of a 2-, 3- and 4-byte char.
+    #[test]
+    fn non_ascii_at_the_cut_point_does_not_panic() {
+        for ch in ["é", "ह", "日", "🙂"] {
+            for pad in 0..4 {
+                let content = format!("{}{}", "a".repeat(597 + pad), ch.repeat(20));
+                let s = FallbackLLM::slim_messages(&[ChatMessage::system(content.clone()), ChatMessage::user("hi")]);
+                let kept = s[0].content.strip_suffix("\nBe concise. Answer directly.").expect("truncated");
+                assert!(kept.len() <= 600 && content.starts_with(kept), "{ch} pad {pad}");
+            }
+        }
     }
 }
