@@ -212,6 +212,57 @@ impl GenericOpenAIBackend {
         )
     }
 
+    /// The agent for a chat request: an error status comes back as a response, so its body -- the
+    /// server's own reason -- can be read (`status_error`). Only the two chat request paths use it.
+    fn build_chat_agent(&self) -> ureq::Agent {
+        ureq::Agent::new_with_config(
+            ureq::config::Config::builder()
+                .timeout_global(Some(crate::call_timeout::call_timeout_for(&self.model)))
+                .http_status_as_error(false)
+                .build()
+        )
+    }
+
+    /// A non-2xx answer as an error that keeps what the server said (Yantrik Mind E.QUOTA1). It
+    /// begins `http status: N` exactly as ureq's own error did, so every matcher of that text keeps
+    /// working; then ` (retry after X)` when the server sent Retry-After, and `: <its words>`. A 429
+    /// that means "your weekly allowance is spent" and one that means "slow down" were the same
+    /// three words before, and the caller waited a minute on each.
+    fn status_error(resp: ureq::http::Response<ureq::Body>) -> anyhow::Error {
+        use std::io::Read as _;
+        let code = resp.status().as_u16();
+        let retry = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().chars().take(40).collect::<String>())
+            .filter(|v| !v.is_empty());
+        let mut raw = Vec::new();
+        let _ = resp.into_body().into_reader().take(4096).read_to_end(&mut raw);
+        let said = Self::server_said(&String::from_utf8_lossy(&raw));
+        let mut msg = format!("http status: {code}");
+        if let Some(r) = retry {
+            msg.push_str(&format!(" (retry after {r})"));
+        }
+        if !said.is_empty() {
+            msg.push_str(": ");
+            msg.push_str(&said);
+        }
+        anyhow::anyhow!(msg)
+    }
+
+    /// What an error body says, as one line of at most 300 characters: `error.message`, `error`, or
+    /// `message` from JSON, else the text itself.
+    pub(crate) fn server_said(body: &str) -> String {
+        let v: Option<serde_json::Value> = serde_json::from_str(body.trim()).ok();
+        let picked = v.as_ref().and_then(|v| {
+            v["error"]["message"].as_str().or_else(|| v["error"].as_str()).or_else(|| v["message"].as_str()).map(str::to_string)
+        });
+        let text = picked.unwrap_or_else(|| body.to_string());
+        let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        one.chars().take(300).collect()
+    }
+
     /// Build auth and extra headers as a vec of (key, value) pairs.
     fn auth_headers(&self) -> Vec<(String, String)> {
         let mut headers = Vec::new();
@@ -295,7 +346,7 @@ impl GenericOpenAIBackend {
         let tool_count = body.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
         tracing::debug!(body_bytes = body_str.len(), tools = tool_count, url = %url, "GenericOpenAI Ollama request");
 
-        let agent = self.build_agent();
+        let agent = self.build_chat_agent();
         let mut req = agent.post(&url).header("Content-Type", "application/json");
         for (k, v) in self.auth_headers() {
             req = req.header(&k, &v);
@@ -311,6 +362,12 @@ impl GenericOpenAIBackend {
             .with_context(|| {
                 format!("Ollama API request to {} failed", crate::call_timeout::shown_endpoint(&url))
             })?;
+        if !resp.status().is_success() {
+            return Err(Self::status_error(resp).context(format!(
+                "Ollama API request to {} failed",
+                crate::call_timeout::shown_endpoint(&url)
+            )));
+        }
 
         Ok(resp.into_body())
     }
@@ -510,7 +567,7 @@ impl GenericOpenAIBackend {
         let url = self.openai_endpoint_url();
         let body_str = serde_json::to_string(body)?;
 
-        let agent = self.build_agent();
+        let agent = self.build_chat_agent();
         let mut req = agent.post(&url).header("Content-Type", "application/json");
         for (k, v) in self.auth_headers() {
             req = req.header(&k, &v);
@@ -525,6 +582,12 @@ impl GenericOpenAIBackend {
                     crate::call_timeout::shown_endpoint(&url)
                 )
             })?;
+        if !resp.status().is_success() {
+            return Err(Self::status_error(resp).context(format!(
+                "OpenAI-compatible API request to {} failed",
+                crate::call_timeout::shown_endpoint(&url)
+            )));
+        }
 
         Ok(resp.into_body())
     }
@@ -1085,5 +1148,76 @@ mod cancel_tests {
         let r = GenericOpenAIBackend::parse_openai_stream(std::io::BufReader::new(sse.as_bytes()), &mut |t| seen.push_str(t))
             .expect("parses");
         assert_eq!((seen.as_str(), r.text.as_str()), ("hi there", "hi there"));
+    }
+}
+
+/// Yantrik Mind E.QUOTA1: an error status keeps what the server said, behind the same prefix.
+#[cfg(test)]
+mod status_body_tests {
+    use super::*;
+    use crate::types::{ChatMessage, GenerationConfig};
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    /// What Ollama Cloud answered on 2026-10-11 once the account's weekly allowance was spent.
+    const OLLAMA_WEEKLY: &str = r#"{"error":{"message":"You reached your Pro weekly limit. Max is $100/month for $300 of usage, with no 5-hour or weekly caps: https://ollama.com/settings/billing (ref: 144bb863-fdc4-4827-83f0-b72167486392)","type":"api_error","param":null,"code":null}}"#;
+
+    /// One answer from a local server: `status`, extra header lines, `body`.
+    fn serve_once(status: &'static str, headers: &'static str, body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let mut sink = vec![0u8; len];
+            let _ = reader.read_exact(&mut sink);
+            let _ = write!(stream, "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    fn chat_err(base: String, ollama: bool) -> String {
+        let b = if ollama {
+            GenericOpenAIBackend::for_provider("ollama", base.trim_end_matches("/v1"), None, "m")
+        } else {
+            GenericOpenAIBackend::for_provider("openai", base, Some("k".into()), "m")
+        };
+        format!("{:#}", b.chat(&[ChatMessage::user("hi")], &GenerationConfig::default(), None).unwrap_err())
+    }
+
+    #[test]
+    fn a_429_keeps_the_prefix_and_says_why() {
+        let e = chat_err(serve_once("429 Too Many Requests", "Content-Type: application/json\r\n", OLLAMA_WEEKLY.into()), false);
+        assert!(e.contains("http status: 429: You reached your Pro weekly limit."), "{e}");
+        assert!(e.starts_with("OpenAI-compatible API request to http://127.0.0.1:"), "the context is kept: {e}");
+        let e = chat_err(serve_once("429 Too Many Requests", "", OLLAMA_WEEKLY.into()), true);
+        assert!(e.contains("http status: 429: You reached your Pro weekly limit."), "the native Ollama path too: {e}");
+    }
+
+    #[test]
+    fn a_retry_after_is_kept_and_an_html_page_is_one_bounded_line() {
+        let e = chat_err(serve_once("429 Too Many Requests", "Retry-After: 120\r\n", r#"{"error":"slow down"}"#.into()), false);
+        assert!(e.contains("http status: 429 (retry after 120): slow down"), "{e}");
+        let page = format!("<html>\n<body>\n{}</body></html>", "Bad gateway. ".repeat(80));
+        let e = chat_err(serve_once("502 Bad Gateway", "Content-Type: text/html\r\n", page), false);
+        let said = e.split("http status: 502: ").nth(1).expect("the prefix");
+        assert!(!said.contains('\n') && said.chars().count() <= 300, "{said}");
+    }
+
+    #[test]
+    fn a_success_is_unchanged() {
+        let base = serve_once("200 OK", "Content-Type: application/json\r\n", r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}]}"#.into());
+        let b = GenericOpenAIBackend::for_provider("openai", base, Some("k".into()), "m");
+        assert_eq!(b.chat(&[ChatMessage::user("hi")], &GenerationConfig::default(), None).unwrap().text, "hello");
     }
 }
