@@ -228,7 +228,7 @@ impl GenericOpenAIBackend {
     /// working; then ` (retry after X)` when the server sent Retry-After, and `: <its words>`. A 429
     /// that means "your weekly allowance is spent" and one that means "slow down" were the same
     /// three words before, and the caller waited a minute on each.
-    fn status_error(resp: ureq::http::Response<ureq::Body>) -> anyhow::Error {
+    fn status_error(&self, resp: ureq::http::Response<ureq::Body>) -> anyhow::Error {
         use std::io::Read as _;
         let code = resp.status().as_u16();
         let retry = resp
@@ -239,7 +239,7 @@ impl GenericOpenAIBackend {
             .filter(|v| !v.is_empty());
         let mut raw = Vec::new();
         let _ = resp.into_body().into_reader().take(4096).read_to_end(&mut raw);
-        let said = Self::server_said(&String::from_utf8_lossy(&raw));
+        let said = Self::server_said(&String::from_utf8_lossy(&raw), &self.secrets());
         let mut msg = format!("http status: {code}");
         if let Some(r) = retry {
             msg.push_str(&format!(" (retry after {r})"));
@@ -252,15 +252,40 @@ impl GenericOpenAIBackend {
     }
 
     /// What an error body says, as one line of at most 300 characters: `error.message`, `error`, or
-    /// `message` from JSON, else the text itself.
-    pub(crate) fn server_said(body: &str) -> String {
+    /// `message` from JSON, else the text itself. It reaches logs and a person, so control
+    /// characters are dropped, the token after any `Bearer` is hidden, and so is each of `secrets`
+    /// (this backend's own key and header values) should the server echo one back. Redaction runs
+    /// before the cut, so a secret is never left half-shown.
+    pub(crate) fn server_said(body: &str, secrets: &[String]) -> String {
         let v: Option<serde_json::Value> = serde_json::from_str(body.trim()).ok();
         let picked = v.as_ref().and_then(|v| {
             v["error"]["message"].as_str().or_else(|| v["error"].as_str()).or_else(|| v["message"].as_str()).map(str::to_string)
         });
         let text = picked.unwrap_or_else(|| body.to_string());
-        let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut words: Vec<String> = text
+            .split_whitespace()
+            .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
+            .filter(|w| !w.is_empty())
+            .collect();
+        for i in 1..words.len() {
+            if words[i - 1].eq_ignore_ascii_case("bearer") {
+                words[i] = "[redacted]".to_string();
+            }
+        }
+        let mut one = words.join(" ");
+        for s in secrets.iter().map(|s| s.trim()).filter(|s| s.len() >= 8) {
+            one = one.replace(s, "[redacted]");
+        }
         one.chars().take(300).collect()
+    }
+
+    /// The values this backend sends that must never be shown: its key and its extra header values.
+    fn secrets(&self) -> Vec<String> {
+        self.api_key
+            .iter()
+            .cloned()
+            .chain(self.presets.extra_headers.iter().map(|(_, v)| v.clone()))
+            .collect()
     }
 
     /// Build auth and extra headers as a vec of (key, value) pairs.
@@ -363,7 +388,7 @@ impl GenericOpenAIBackend {
                 format!("Ollama API request to {} failed", crate::call_timeout::shown_endpoint(&url))
             })?;
         if !resp.status().is_success() {
-            return Err(Self::status_error(resp).context(format!(
+            return Err(self.status_error(resp).context(format!(
                 "Ollama API request to {} failed",
                 crate::call_timeout::shown_endpoint(&url)
             )));
@@ -583,7 +608,7 @@ impl GenericOpenAIBackend {
                 )
             })?;
         if !resp.status().is_success() {
-            return Err(Self::status_error(resp).context(format!(
+            return Err(self.status_error(resp).context(format!(
                 "OpenAI-compatible API request to {} failed",
                 crate::call_timeout::shown_endpoint(&url)
             )));
@@ -1212,6 +1237,28 @@ mod status_body_tests {
         let e = chat_err(serve_once("502 Bad Gateway", "Content-Type: text/html\r\n", page), false);
         let said = e.split("http status: 502: ").nth(1).expect("the prefix");
         assert!(!said.contains('\n') && said.chars().count() <= 300, "{said}");
+    }
+
+    /// A server that echoes the key, a Bearer header or a terminal escape: none of it is shown.
+    #[test]
+    fn an_echoed_key_a_bearer_token_and_control_characters_are_not_shown() {
+        let body = r#"{"error":{"message":"Incorrect API key provided: sk-live-TOPSECRET-1234. Sent Authorization: Bearer abc.def.ghi \u001b[31mred\u001b[0m"}}"#;
+        let base = serve_once("401 Unauthorized", "Content-Type: application/json\r\n", body.into());
+        let b = GenericOpenAIBackend::for_provider("openai", base, Some("sk-live-TOPSECRET-1234".into()), "m");
+        let e = format!("{:#}", b.chat(&[ChatMessage::user("hi")], &GenerationConfig::default(), None).unwrap_err());
+        assert!(e.contains("http status: 401: Incorrect API key provided: [redacted]"), "{e}");
+        assert!(!e.contains("TOPSECRET") && !e.contains("abc.def.ghi"), "{e}");
+        assert!(!e.chars().any(|c| c.is_control()), "{e:?}");
+        assert!(e.contains("Bearer [redacted]") && e.contains("[31mred"), "{e}");
+    }
+
+    /// A key that would straddle the 300-character cut is hidden whole, not half.
+    #[test]
+    fn a_key_at_the_cut_is_hidden_whole() {
+        let key = "sk-0123456789abcdef".to_string();
+        let said = GenericOpenAIBackend::server_said(&format!("{} {key}", "x".repeat(290)), &[key]);
+        assert!(!said.contains("sk-01"), "{said}");
+        assert!(said.chars().count() <= 300);
     }
 
     #[test]
