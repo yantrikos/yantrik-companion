@@ -32,6 +32,8 @@ mod token_stream;
 mod llm;
 /// The wall-clock ceiling on one model call, shared by every HTTP client in this crate.
 pub mod call_timeout;
+/// E.VOICE2: a per-thread cancel flag that ends a streamed model request between lines.
+pub mod call_cancel;
 pub mod model_overrides;
 pub mod think_policy;
 

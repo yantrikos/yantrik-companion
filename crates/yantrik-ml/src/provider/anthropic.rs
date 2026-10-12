@@ -366,6 +366,8 @@ impl LLMBackend for AnthropicBackend {
         let mut api_tool_calls = Vec::new();
 
         for line_result in reader.lines() {
+            // E.VOICE2: a cancelled request stops reading here; dropping the body closes it.
+            crate::call_cancel::check()?;
             let line: String = line_result.context("reading Anthropic SSE line")?;
 
             let data = match line.strip_prefix("data: ") {

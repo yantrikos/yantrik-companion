@@ -329,6 +329,8 @@ impl ApiLLM {
         let mut think_buf = String::new();
 
         for line_result in reader.lines() {
+            // E.VOICE2: a cancelled request stops reading here; dropping the body closes it.
+            crate::call_cancel::check()?;
             let line: String = line_result.context("reading Ollama stream line")?;
             if line.trim().is_empty() {
                 continue;
@@ -747,6 +749,8 @@ impl ApiLLM {
         let mut in_tool_use = false;
 
         for line_result in reader.lines() {
+            // E.VOICE2: a cancelled request stops reading here; dropping the body closes it.
+            crate::call_cancel::check()?;
             let line: String = line_result.context("reading Anthropic SSE line")?;
 
             let data = if let Some(stripped) = line.strip_prefix("data: ") {
@@ -1031,6 +1035,8 @@ impl LLMBackend for ApiLLM {
         let mut tc_args: HashMap<usize, String> = HashMap::new();
 
         for line_result in reader.lines() {
+            // E.VOICE2: a cancelled request stops reading here; dropping the body closes it.
+            crate::call_cancel::check()?;
             let line: String = line_result.context("reading SSE line")?;
 
             let data = if let Some(stripped) = line.strip_prefix("data: ") {
