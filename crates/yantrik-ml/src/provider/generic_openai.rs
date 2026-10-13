@@ -551,6 +551,10 @@ impl GenericOpenAIBackend {
         if stream && std::env::var("YM_STREAM_USAGE").map(|v| v.trim() != "0").unwrap_or(true) {
             body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
+        // The ask bar's effort (yantrik-os #673), only when the caller set it.
+        if let Some(effort) = config.effort.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+            body["effort"] = serde_json::json!(effort);
+        }
 
         if let Some(p) = config.top_p {
             body["top_p"] = serde_json::json!(p);
@@ -968,6 +972,17 @@ mod usage_tests {
         assert_eq!(seen, "hi", "the text still streams");
         assert_eq!((r.prompt_tokens, r.completion_tokens), (0, 0));
         assert_eq!(r.stop_reason, "stop");
+    }
+
+    /// The ask bar's effort goes in the body only when set.
+    #[test]
+    fn effort_is_sent_only_when_set() {
+        let b = backend();
+        let msgs = vec![ChatMessage::user("hi")];
+        let none = b.build_openai_body(&msgs, &GenerationConfig::default(), None, false);
+        assert!(none.get("effort").is_none(), "{none}");
+        let cfg = GenerationConfig { effort: Some("high".into()), ..Default::default() };
+        assert_eq!(b.build_openai_body(&msgs, &cfg, None, true)["effort"], serde_json::json!("high"));
     }
 
     /// The ask itself. Measured against the local model: streaming WITHOUT this option returns no
