@@ -14,6 +14,12 @@ use crate::chat_template;
 use crate::traits::LLMBackend;
 use crate::types::{ApiToolCall, ApiToolCallFunction, ChatMessage, GenerationConfig, LLMResponse, ToolCall};
 
+/// Yantrik OS's model gateway, the one server that reads `effort`. Matched exactly, as the Mind
+/// matches it: plain OpenAI and some compatible servers answer an unknown body field with a 400.
+const EFFORT_GATEWAY_URL: &str = "http://127.0.0.1:7460/v1";
+/// The gateway's effort words. It ignores any other word silently, so a typo is dropped here.
+const EFFORT_WORDS: [&str; 4] = ["easy", "medium", "high", "xhigh"];
+
 /// Provider-specific presets that modify request behavior.
 #[derive(Debug, Clone)]
 pub struct ProviderPresets {
@@ -551,9 +557,17 @@ impl GenericOpenAIBackend {
         if stream && std::env::var("YM_STREAM_USAGE").map(|v| v.trim() != "0").unwrap_or(true) {
             body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
-        // The ask bar's effort (yantrik-os #673), only when the caller set it.
+        // The ask bar's effort (yantrik-os #673), only when the caller set it, only to the OS's
+        // gateway, and only as one of its four words.
         if let Some(effort) = config.effort.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
-            body["effort"] = serde_json::json!(effort);
+            let word = effort.to_ascii_lowercase();
+            if self.base_url.trim_end_matches('/') != EFFORT_GATEWAY_URL {
+                tracing::debug!(effort = %word, url = %self.base_url, "effort dropped: only the Yantrik OS gateway reads it");
+            } else if !EFFORT_WORDS.contains(&word.as_str()) {
+                tracing::debug!(effort = %word, "effort dropped: not one of easy, medium, high, xhigh");
+            } else {
+                body["effort"] = serde_json::json!(word);
+            }
         }
 
         if let Some(p) = config.top_p {
@@ -974,15 +988,46 @@ mod usage_tests {
         assert_eq!(r.stop_reason, "stop");
     }
 
+    fn gateway() -> GenericOpenAIBackend {
+        GenericOpenAIBackend::for_provider("openai", "http://127.0.0.1:7460/v1/", Some("k".into()), "picked")
+    }
+
     /// The ask bar's effort goes in the body only when set.
     #[test]
     fn effort_is_sent_only_when_set() {
-        let b = backend();
+        let b = gateway();
         let msgs = vec![ChatMessage::user("hi")];
         let none = b.build_openai_body(&msgs, &GenerationConfig::default(), None, false);
         assert!(none.get("effort").is_none(), "{none}");
-        let cfg = GenerationConfig { effort: Some("high".into()), ..Default::default() };
+        let cfg = GenerationConfig { effort: Some("High".into()), ..Default::default() };
         assert_eq!(b.build_openai_body(&msgs, &cfg, None, true)["effort"], serde_json::json!("high"));
+    }
+
+    /// Any other server may answer an unknown field with a 400, so it never sees `effort`.
+    #[test]
+    fn effort_reaches_only_the_gateway() {
+        let msgs = vec![ChatMessage::user("hi")];
+        let cfg = GenerationConfig { effort: Some("high".into()), ..Default::default() };
+        for url in ["https://api.openai.com/v1", "http://127.0.0.1:7461/v1", "http://127.0.0.1:7460/v1/x", "http://localhost:7460/v1"] {
+            let b = GenericOpenAIBackend::for_provider("openai", url, Some("k".into()), "gpt");
+            let body = b.build_openai_body(&msgs, &cfg, None, false);
+            assert!(body.get("effort").is_none(), "{url}: {body}");
+        }
+    }
+
+    /// A word the gateway does not know is dropped, not sent to be ignored.
+    #[test]
+    fn effort_outside_the_four_words_is_dropped() {
+        let b = gateway();
+        let msgs = vec![ChatMessage::user("hi")];
+        for word in ["hihg", "low", "max"] {
+            let cfg = GenerationConfig { effort: Some(word.into()), ..Default::default() };
+            assert!(b.build_openai_body(&msgs, &cfg, None, false).get("effort").is_none(), "{word}");
+        }
+        for word in EFFORT_WORDS {
+            let cfg = GenerationConfig { effort: Some(word.into()), ..Default::default() };
+            assert_eq!(b.build_openai_body(&msgs, &cfg, None, false)["effort"], serde_json::json!(word));
+        }
     }
 
     /// The ask itself. Measured against the local model: streaming WITHOUT this option returns no
