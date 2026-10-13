@@ -196,11 +196,24 @@ impl FallbackLLM {
     /// clears the cooldown, a failure starts a new one. The old rule (`count % 10 != 0`) never let
     /// the count reach 10, since a skipped call records nothing, so three failures skipped the
     /// primary for the rest of the process.
+    ///
+    /// One probe, not a stampede (yantrik-os-dc's review of #4): the first caller past the end of a
+    /// cooldown moves it on by another cooldown before it tries the primary, so concurrent callers
+    /// keep using the fallback meanwhile. Its success clears the cooldown; its failure leaves a
+    /// fresh one.
     fn should_skip_primary(&self) -> bool {
-        self.skip_until
-            .lock()
-            .map(|until| until.is_some_and(|t| std::time::Instant::now() < t))
-            .unwrap_or(false)
+        let Ok(mut until) = self.skip_until.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        match *until {
+            Some(t) if now < t => true,
+            Some(_) => {
+                *until = Some(now + self.cooldown);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Slim down messages for the tiny fallback model (yantrik-os's version): the last user turn,
@@ -645,7 +658,7 @@ mod cooldown_tests {
     fn after_the_cooldown_the_primary_is_tried_again_and_a_success_clears_it() {
         let primary = flaky(true);
         let fallback = flaky(false);
-        let llm = FallbackLLM::with_fallback(primary.clone(), fallback.clone()).with_cooldown(std::time::Duration::from_millis(150));
+        let llm = FallbackLLM::with_fallback(primary.clone(), fallback.clone()).with_cooldown(std::time::Duration::from_millis(20));
         for _ in 0..3 {
             llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
         }
@@ -664,7 +677,7 @@ mod cooldown_tests {
     #[test]
     fn a_failure_after_the_cooldown_starts_another() {
         let primary = flaky(true);
-        let llm = FallbackLLM::with_fallback(primary.clone(), flaky(false)).with_cooldown(std::time::Duration::from_millis(150));
+        let llm = FallbackLLM::with_fallback(primary.clone(), flaky(false)).with_cooldown(std::time::Duration::from_millis(20));
         for _ in 0..3 {
             llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
         }
@@ -673,6 +686,45 @@ mod cooldown_tests {
         assert_eq!(primary.calls.load(Ordering::SeqCst), 4, "tried once after the cooldown");
         llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
         assert_eq!(primary.calls.load(Ordering::SeqCst), 4, "it failed, so a new cooldown runs");
+    }
+
+    /// When a cooldown ends, one caller probes the primary; a concurrent one keeps the fallback.
+    #[test]
+    fn after_a_cooldown_one_caller_probes_and_the_others_keep_the_fallback() {
+        struct SlowDown(AtomicUsize);
+        impl LLMBackend for SlowDown {
+            fn chat(&self, _: &[ChatMessage], _: &GenerationConfig, _: Option<&[serde_json::Value]>) -> Result<LLMResponse> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                anyhow::bail!("connection reset")
+            }
+            fn chat_streaming(&self, m: &[ChatMessage], c: &GenerationConfig, t: Option<&[serde_json::Value]>, _: &mut dyn FnMut(&str)) -> Result<LLMResponse> {
+                self.chat(m, c, t)
+            }
+            fn count_tokens(&self, t: &str) -> Result<usize> {
+                Ok(t.len())
+            }
+            fn backend_name(&self) -> &str {
+                "slow-down"
+            }
+        }
+        let primary = Arc::new(SlowDown(AtomicUsize::new(0)));
+        let llm = Arc::new(FallbackLLM::with_fallback(primary.clone(), flaky(false)).with_cooldown(std::time::Duration::from_millis(20)));
+        for _ in 0..3 {
+            llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
+        }
+        assert_eq!(primary.0.load(Ordering::SeqCst), 3);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let llm = llm.clone();
+                std::thread::spawn(move || llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap())
+            })
+            .collect();
+        for r in racers {
+            r.join().unwrap();
+        }
+        assert_eq!(primary.0.load(Ordering::SeqCst), 4, "more than one caller probed the down primary");
     }
 
     /// The flag is set while the primary works; it then fails for a real reason. No fallback starts.
