@@ -152,6 +152,13 @@ pub struct GenerationConfig {
     /// escalation sets this true while keeping think=false: strong model, fast generation, no queue.
     #[serde(default)]
     pub prefer_reasoner: bool,
+    /// How hard the person asked the model to think: `easy`, `medium`, `high` or `xhigh` (Yantrik
+    /// OS's ask bar, yantrik-os #673). Sent as the request's `effort` only when set, only to the OS's
+    /// model gateway (http://127.0.0.1:7460/v1, matched exactly), and only as one of those four words;
+    /// anything else is dropped with a debug line. The gateway turns it into each provider's own
+    /// knob. None (the default) sends nothing.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 impl Default for GenerationConfig {
@@ -168,6 +175,7 @@ impl Default for GenerationConfig {
             max_context: None,
             think: None,
             prefer_reasoner: false,
+            effort: None,
         }
     }
 }
