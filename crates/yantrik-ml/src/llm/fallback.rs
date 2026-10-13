@@ -44,7 +44,20 @@ pub struct FallbackLLM {
     fallback_config: Option<FallbackConfig>,
     /// Track consecutive primary failures to avoid slow retries
     primary_failures: Mutex<u32>,
+    /// After `SKIP_AFTER` consecutive real failures the primary is skipped until this instant; then
+    /// it is tried once. A success clears it; a failure starts a new cooldown.
+    skip_until: Mutex<Option<std::time::Instant>>,
+    cooldown: std::time::Duration,
 }
+
+/// Consecutive real primary failures before the primary is skipped (a cancel is never one).
+const SKIP_AFTER: u32 = 3;
+/// How long the primary is skipped after `SKIP_AFTER` failures before it is tried again.
+const PRIMARY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
+/// What the fallback keeps of each system message, in bytes.
+const SLIM_SYSTEM_CHARS: usize = 600;
+/// Plain chat turns kept before the last user message.
+const SLIM_HISTORY_TURNS: usize = 4;
 
 impl FallbackLLM {
     /// Create a new FallbackLLM.
@@ -60,6 +73,8 @@ impl FallbackLLM {
             fallback: Mutex::new(None),
             fallback_config,
             primary_failures: Mutex::new(0),
+            skip_until: Mutex::new(None),
+            cooldown: PRIMARY_COOLDOWN,
         }
     }
 
@@ -73,6 +88,8 @@ impl FallbackLLM {
             fallback: Mutex::new(Some(fallback)),
             fallback_config: None,
             primary_failures: Mutex::new(0),
+            skip_until: Mutex::new(None),
+            cooldown: PRIMARY_COOLDOWN,
         }
     }
 
@@ -139,7 +156,14 @@ impl FallbackLLM {
         Ok(fb)
     }
 
-    /// Record a primary success — reset failure counter.
+    /// How long the primary is skipped after `SKIP_AFTER` failures (tests shorten it).
+    #[cfg(test)]
+    fn with_cooldown(mut self, cooldown: std::time::Duration) -> Self {
+        self.cooldown = cooldown;
+        self
+    }
+
+    /// Record a primary success — reset failure counter and any cooldown.
     fn primary_success(&self) {
         if let Ok(mut count) = self.primary_failures.lock() {
             if *count > 0 {
@@ -147,75 +171,106 @@ impl FallbackLLM {
                 *count = 0;
             }
         }
+        if let Ok(mut until) = self.skip_until.lock() {
+            *until = None;
+        }
     }
 
-    /// Record a primary failure — increment counter.
+    /// Record a real primary failure. From the `SKIP_AFTER`th in a row, each one starts a cooldown.
     fn primary_failure(&self) {
-        if let Ok(mut count) = self.primary_failures.lock() {
-            *count += 1;
+        let count = match self.primary_failures.lock() {
+            Ok(mut count) => {
+                *count += 1;
+                *count
+            }
+            Err(_) => return,
+        };
+        if count >= SKIP_AFTER {
+            if let Ok(mut until) = self.skip_until.lock() {
+                *until = Some(std::time::Instant::now() + self.cooldown);
+            }
         }
     }
 
-    /// Check if we should skip the primary (too many consecutive failures).
-    /// After 3 consecutive failures, go straight to fallback for 10 calls,
-    /// then retry primary once.
+    /// Skip the primary while a cooldown runs. When it ends the primary is tried once: a success
+    /// clears the cooldown, a failure starts a new one. The old rule (`count % 10 != 0`) never let
+    /// the count reach 10, since a skipped call records nothing, so three failures skipped the
+    /// primary for the rest of the process.
+    ///
+    /// One probe, not a stampede (yantrik-os-dc's review of #4): the first caller past the end of a
+    /// cooldown moves it on by another cooldown before it tries the primary, so concurrent callers
+    /// keep using the fallback meanwhile. Its success clears the cooldown; its failure leaves a
+    /// fresh one.
     fn should_skip_primary(&self) -> bool {
-        if let Ok(count) = self.primary_failures.lock() {
-            *count >= 3 && *count % 10 != 0
-        } else {
-            false
+        let Ok(mut until) = self.skip_until.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        match *until {
+            Some(t) if now < t => true,
+            Some(_) => {
+                *until = Some(now + self.cooldown);
+                false
+            }
+            None => false,
         }
     }
 
-    /// Slim down messages for the tiny fallback model.
-    /// Keeps system prompt (truncated), last user message, and at most 2 history turns.
+    /// Slim down messages for the tiny fallback model (yantrik-os's version): the last user turn,
+    /// up to `SLIM_HISTORY_TURNS` plain chat turns before it, never cutting into a tool round, and
+    /// every system message, each cut to `SLIM_SYSTEM_CHARS`. A conversation with no user turn is
+    /// sent as it is.
     fn slim_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-        let mut slim = Vec::with_capacity(4);
-
-        // System message: truncate to ~600 chars
-        if let Some(sys) = messages.first() {
-            if sys.role == "system" {
-                let content = if sys.content.len() > 600 {
-                    // Find a safe truncation point
-                    let mut end = 600;
-                    while end > 0 && !sys.content.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}\nBe concise. Answer directly.", &sys.content[..end])
-                } else {
-                    sys.content.clone()
-                };
-                slim.push(ChatMessage::system(content));
+        let Some(last_user) = messages.iter().rposition(|m| m.role == "user") else {
+            tracing::warn!(count = messages.len(), "Fallback given a conversation with no user turn — sending it unslimmed");
+            return messages.to_vec();
+        };
+        let mut start = last_user;
+        while start > 0 && last_user - start < SLIM_HISTORY_TURNS {
+            let prev = &messages[start - 1];
+            let plain = (prev.role == "user" || prev.role == "assistant") && prev.tool_calls.is_none();
+            if !plain {
+                break;
             }
+            start -= 1;
         }
-
-        // Last user message (always keep)
-        if let Some(last) = messages.last() {
-            if last.role == "user" {
-                // Keep at most 4 preceding messages, never the system prompt pushed above.
-                // The floor is 1 only when messages[0] IS that prompt: a lone user message has
-                // nothing before it, and `1..0` panicked.
-                let first_kept = usize::from(messages[0].role == "system");
-                let history_start = messages.len().saturating_sub(5).max(first_kept);
-                for msg in &messages[history_start..messages.len() - 1] {
-                    slim.push(msg.clone());
-                }
-                slim.push(last.clone());
-            }
+        let mut slim: Vec<ChatMessage> = messages[..start]
+            .iter()
+            .filter(|m| m.role == "system")
+            .cloned()
+            .chain(messages[start..].iter().cloned())
+            .collect();
+        for msg in slim.iter_mut().filter(|m| m.role == "system") {
+            msg.content = truncate_on_char_boundary(&msg.content, SLIM_SYSTEM_CHARS);
         }
-
+        if let Some(last_sys) = slim.iter_mut().filter(|m| m.role == "system").last() {
+            last_sys.content.push_str("\nBe concise. Answer directly.");
+        }
         slim
     }
 
-    /// Reduced generation config for fallback: fewer tokens, lower temp.
+    /// Reduced generation config for fallback: fewer tokens, lower temp. Built from the caller's
+    /// config (yantrik-os's version), so stop sequences, top_k and the rest are kept: `Default`
+    /// dropped them, and stop sequences are how a local model is told when to stop.
     fn slim_config(config: &GenerationConfig) -> GenerationConfig {
         GenerationConfig {
             max_tokens: config.max_tokens.min(512),
             temperature: config.temperature.min(0.5),
-            top_p: config.top_p,
-            ..Default::default()
+            ..config.clone()
         }
     }
+}
+
+/// Truncate to at most `max` bytes without splitting a UTF-8 character.
+fn truncate_on_char_boundary(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 impl LLMBackend for FallbackLLM {
@@ -241,7 +296,7 @@ impl LLMBackend for FallbackLLM {
                 Ok(resp)
             }
             // A cancel is not a failure: no count against the primary, no fallback request.
-            Err(e) if crate::call_cancel::is_cancel(&e) => Err(e),
+            Err(e) if crate::call_cancel::is_cancel(&e) || crate::call_cancel::cancelled() => Err(e),
             Err(primary_err) => {
                 self.primary_failure();
                 tracing::warn!(
@@ -291,7 +346,7 @@ impl LLMBackend for FallbackLLM {
             }
             // A cancel is not a failure: no count against the primary, and no fallback stream
             // appending a second answer to the tokens already sent.
-            Err(e) if crate::call_cancel::is_cancel(&e) => Err(e),
+            Err(e) if crate::call_cancel::is_cancel(&e) || crate::call_cancel::cancelled() => Err(e),
             Err(primary_err) => {
                 self.primary_failure();
                 tracing::warn!(
@@ -532,19 +587,19 @@ mod slim_tests {
         assert_eq!(s[5].content, "last");
     }
 
-    /// Tool messages never panic. Ending on a tool result (mid tool round) leaves only the system
-    /// prompt -- known and pre-existing; the yantrik-os copy anchors on the last user turn instead.
+    /// Tool messages never panic, and a conversation ending on a tool result keeps its last user
+    /// turn and that round (the yantrik-os anchor; the old slimming left only the system prompt).
     #[test]
     fn tool_messages_do_not_panic() {
         let s = FallbackLLM::slim_messages(&[tool_result("c1", "r")]);
-        assert!(s.is_empty());
+        assert_eq!(s.len(), 1, "no user turn: sent as it is");
         let m = [ChatMessage::system("sys"), ChatMessage::user("find food"), tool_result("c1", "r")];
         let s = FallbackLLM::slim_messages(&m);
-        assert_eq!(s.len(), 1);
+        assert_eq!(s.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(), ["system", "user", "tool"]);
         let m = [ChatMessage::system("sys"), tool_result("c1", "r"), ChatMessage::user("and?")];
-        assert_eq!(FallbackLLM::slim_messages(&m).len(), 3);
+        assert_eq!(FallbackLLM::slim_messages(&m).len(), 2, "a tool round before the last user turn is not cut into");
         let m = [tool_result("c1", "r"), ChatMessage::user("and?")];
-        assert_eq!(FallbackLLM::slim_messages(&m).len(), 2);
+        assert_eq!(FallbackLLM::slim_messages(&m).len(), 1);
     }
 
     /// Byte 600 falls inside a multi-byte character at every offset of a 2-, 3- and 4-byte char.
@@ -558,5 +613,153 @@ mod slim_tests {
                 assert!(kept.len() <= 600 && content.starts_with(kept), "{ch} pad {pad}");
             }
         }
+    }
+}
+
+/// Yantrik Mind follow-up to #2's review: three real failures skip the primary for a cooldown, not
+/// for the rest of the process; after a cancel no fallback starts whatever the primary returned.
+#[cfg(test)]
+mod cooldown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct Flaky {
+        calls: AtomicUsize,
+        failing: AtomicBool,
+    }
+    impl LLMBackend for Flaky {
+        fn chat(&self, _: &[ChatMessage], _: &GenerationConfig, _: Option<&[serde_json::Value]>) -> Result<LLMResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.failing.load(Ordering::SeqCst) {
+                anyhow::bail!("connection reset");
+            }
+            Ok(LLMResponse { text: "ok".into(), ..Default::default() })
+        }
+        fn chat_streaming(&self, m: &[ChatMessage], c: &GenerationConfig, t: Option<&[serde_json::Value]>, _: &mut dyn FnMut(&str)) -> Result<LLMResponse> {
+            self.chat(m, c, t)
+        }
+        fn count_tokens(&self, t: &str) -> Result<usize> {
+            Ok(t.len())
+        }
+        fn backend_name(&self) -> &str {
+            "flaky"
+        }
+    }
+
+    fn flaky(failing: bool) -> Arc<Flaky> {
+        Arc::new(Flaky { calls: AtomicUsize::new(0), failing: AtomicBool::new(failing) })
+    }
+
+    fn msgs() -> Vec<ChatMessage> {
+        vec![ChatMessage::system("be brief"), ChatMessage::user("hi")]
+    }
+
+    #[test]
+    fn after_the_cooldown_the_primary_is_tried_again_and_a_success_clears_it() {
+        let primary = flaky(true);
+        let fallback = flaky(false);
+        let llm = FallbackLLM::with_fallback(primary.clone(), fallback.clone()).with_cooldown(std::time::Duration::from_millis(20));
+        for _ in 0..3 {
+            llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
+        }
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 3);
+        llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 3, "skipped during the cooldown");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        primary.failing.store(false, Ordering::SeqCst);
+        llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 4, "tried again once the cooldown ended");
+        assert!(!llm.is_degraded(), "a success clears it");
+        llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 5, "and it is used again");
+    }
+
+    #[test]
+    fn a_failure_after_the_cooldown_starts_another() {
+        let primary = flaky(true);
+        let llm = FallbackLLM::with_fallback(primary.clone(), flaky(false)).with_cooldown(std::time::Duration::from_millis(20));
+        for _ in 0..3 {
+            llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 4, "tried once after the cooldown");
+        llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 4, "it failed, so a new cooldown runs");
+    }
+
+    /// When a cooldown ends, one caller probes the primary; a concurrent one keeps the fallback.
+    #[test]
+    fn after_a_cooldown_one_caller_probes_and_the_others_keep_the_fallback() {
+        struct SlowDown(AtomicUsize);
+        impl LLMBackend for SlowDown {
+            fn chat(&self, _: &[ChatMessage], _: &GenerationConfig, _: Option<&[serde_json::Value]>) -> Result<LLMResponse> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                anyhow::bail!("connection reset")
+            }
+            fn chat_streaming(&self, m: &[ChatMessage], c: &GenerationConfig, t: Option<&[serde_json::Value]>, _: &mut dyn FnMut(&str)) -> Result<LLMResponse> {
+                self.chat(m, c, t)
+            }
+            fn count_tokens(&self, t: &str) -> Result<usize> {
+                Ok(t.len())
+            }
+            fn backend_name(&self) -> &str {
+                "slow-down"
+            }
+        }
+        let primary = Arc::new(SlowDown(AtomicUsize::new(0)));
+        let llm = Arc::new(FallbackLLM::with_fallback(primary.clone(), flaky(false)).with_cooldown(std::time::Duration::from_millis(20)));
+        for _ in 0..3 {
+            llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap();
+        }
+        assert_eq!(primary.0.load(Ordering::SeqCst), 3);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let llm = llm.clone();
+                std::thread::spawn(move || llm.chat(&msgs(), &GenerationConfig::default(), None).unwrap())
+            })
+            .collect();
+        for r in racers {
+            r.join().unwrap();
+        }
+        assert_eq!(primary.0.load(Ordering::SeqCst), 4, "more than one caller probed the down primary");
+    }
+
+    /// The flag is set while the primary works; it then fails for a real reason. No fallback starts.
+    #[test]
+    fn after_a_cancel_no_fallback_starts_whatever_the_primary_returned() {
+        struct FailsAfterCancel(Arc<AtomicBool>);
+        impl LLMBackend for FailsAfterCancel {
+            fn chat(&self, _: &[ChatMessage], _: &GenerationConfig, _: Option<&[serde_json::Value]>) -> Result<LLMResponse> {
+                self.0.store(true, Ordering::SeqCst);
+                anyhow::bail!("connection reset")
+            }
+            fn chat_streaming(&self, m: &[ChatMessage], c: &GenerationConfig, t: Option<&[serde_json::Value]>, _: &mut dyn FnMut(&str)) -> Result<LLMResponse> {
+                self.chat(m, c, t)
+            }
+            fn count_tokens(&self, t: &str) -> Result<usize> {
+                Ok(t.len())
+            }
+            fn backend_name(&self) -> &str {
+                "fails-after-cancel"
+            }
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        let _g = crate::call_cancel::install_cancel(Some(flag.clone()));
+        let fallback = flaky(false);
+        let llm = FallbackLLM::with_fallback(Arc::new(FailsAfterCancel(flag)), fallback.clone());
+        assert!(llm.chat(&msgs(), &GenerationConfig::default(), None).is_err());
+        assert_eq!(fallback.calls.load(Ordering::SeqCst), 0, "a fallback started after the cancel");
+        assert!(!llm.is_degraded(), "a cancelled call is not counted against the primary");
+    }
+
+    #[test]
+    fn the_slim_config_keeps_the_callers_stop_sequences() {
+        let cfg = GenerationConfig { stop: vec!["</s>".into()], max_tokens: 4096, ..Default::default() };
+        let slim = FallbackLLM::slim_config(&cfg);
+        assert_eq!(slim.stop, cfg.stop);
+        assert_eq!(slim.max_tokens, 512);
     }
 }
